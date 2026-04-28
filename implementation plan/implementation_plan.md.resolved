@@ -1,0 +1,308 @@
+# Webtoon Scroll Camera System
+
+## The Core Problem
+
+Manhwa/webtoon images are tall vertical strips (~709×2058, ratio ≈ 1:3). The current pipeline was designed for manga layouts:
+
+| Current Pipeline Step | What it assumes | What webtoon actually needs |
+|---|---|---|
+| **panelSplitter** | Clear gutters (black/white lines) separate panels | Seamless artwork, no gutters — art flows continuously |
+| **cameraDirector** | Independent focus regions to zoom into | A **scroll path** — camera flows top→bottom through the strip |
+| **videoRenderer** (multi-shot) | Cut between static zoom shots | **Continuous smooth motion** — scroll + zoom + pause |
+| **Ken Burns fallback** | Center-crop + slight zoom | Misses 60%+ of the strip content |
+
+The fundamental mismatch: **manga is a grid of independent panels; webtoon is a single continuous vertical canvas**. We need a completely different camera system for the webtoon format.
+
+## What Professional Creators Do
+
+Top manhwa recap channels simulate the **phone-reading experience**:
+
+1. **Continuous vertical scroll** — camera viewport (9:16) moves down the tall canvas
+2. **Zoom pulses** — camera zooms in at faces/action, pulls back at wide scenes
+3. **Speed modulation** — faster through transitions, slower at dramatic moments
+4. **Dwell/hold** — camera pauses on dramatic reveals before continuing
+5. **Eased motion** — smooth acceleration/deceleration, never jerky
+
+---
+
+## Architecture Overview
+
+```mermaid
+flowchart TD
+    A["Chapter Images<br/>709×2058 each"] --> B{"Format Detection<br/>isWebtoonStrip()"}
+    B -->|"height/width ≥ 2.0"| C["WEBTOON PATH"]
+    B -->|"height/width < 2.0"| D["MANGA PATH<br/>(existing pipeline)"]
+    
+    C --> E["AI Strip Analysis<br/>Gemini Vision<br/>webtoon-specific prompt"]
+    E --> F["Interest Points<br/>{y, x, importance,<br/>type, zoom, label}"]
+    F --> G["Scroll Path Planner<br/>buildScrollPath()"]
+    G --> H["Keyframes<br/>{frame, y, zoom, easing}"]
+    H --> I["FFmpeg Expression<br/>Generator<br/>Piecewise zoompan"]
+    I --> J["Single Continuous<br/>Scroll Clip per strip"]
+    J --> K["Concat + Audio + Subs"]
+```
+
+---
+
+## Proposed Changes
+
+### Webtoon Camera Service
+
+#### [NEW] [webtoonCamera.js](file:///c:/Users/parvi/Documents/animereels/server/services/webtoonCamera.js)
+
+The core new service. Contains five tightly integrated subsystems:
+
+**1. Format Detection**
+```js
+export function isWebtoonStrip(width, height) {
+  return height / width >= 2.0;  // 709×2058 = ratio 2.9 ✓
+}
+```
+
+**2. AI Strip Analysis — Webtoon-Specific Gemini Prompt**
+
+The current `cameraDirector.js` prompt asks for "focus regions" (bounding boxes). For webtoon strips we need **interest points along the vertical axis** with importance scores:
+
+```
+You are analyzing a vertical manhwa/webtoon strip image.
+This is a TALL image read by scrolling top-to-bottom.
+
+Identify 4-7 KEY MOMENTS along the vertical scroll.
+For each moment provide:
+- y_center: vertical position (0.0=top, 1.0=bottom)
+- x_center: horizontal center of interest (0.0=left, 1.0=right)
+- importance: 1-5 (5=most dramatic — face closeup, action impact)
+- type: "face_closeup" | "action_impact" | "dialogue" |
+        "reveal" | "scenery" | "transition"
+- zoom: "tight" | "medium" | "wide"
+- label: brief description
+
+RULES:
+- Cover the FULL strip top-to-bottom
+- At minimum: one point in top 25%, one in middle, one in bottom 25%
+- Character FACES → importance 4-5, zoom "tight"
+- Action impacts → importance 4-5, zoom "medium"
+- Dialogue/talking → importance 3, zoom "medium"
+- Scene transitions/scenery → importance 1-2, zoom "wide"
+- Skip title cards, credits, logos entirely
+- Points MUST be in top-to-bottom order
+```
+
+**3. Scroll Path Planner — `buildScrollPath()`**
+
+This is the intellectual core. Given interest points + duration, it produces a keyframe array that defines the camera's journey:
+
+```
+Algorithm:
+  1. Sort interest points by y_center (should already be ordered)
+  2. Ensure coverage: inject synthetic points if gaps > 30% of strip
+  3. Time allocation:
+     - Total time = T seconds
+     - For each point: dwell_time = base × (0.5 + importance/5)
+       (importance 5 → 1.5× base dwell, importance 1 → 0.7×)
+     - Remaining time = scroll transitions between points
+     - Scroll speed ∝ distance between consecutive points
+  4. Generate keyframes:
+     - [Arrive at point] → ease-out deceleration
+     - [Dwell at point]  → hold + subtle 5% zoom bump
+     - [Leave point]     → ease-in acceleration toward next
+  5. Zoom levels per type:
+     - tight: 3.2  (face fills ~60% of frame)
+     - medium: 2.4 (upper body / action)
+     - wide: 1.8   (full scene width)
+```
+
+Output: `Keyframe[]` where each keyframe is `{ frame, y, x, zoom, easing }`.
+
+**4. FFmpeg Expression Generator — `buildZoompanExpression()`**
+
+Converts keyframes into piecewise zoompan expressions using FFmpeg's expression evaluator. This is what makes the scroll smooth and continuous within a single FFmpeg call — no concatenation of sub-clips needed.
+
+For N keyframes, generates nested `if(lt(on, frameN), lerp(...), ...)` expressions:
+
+```
+z = if(lt(on,50),  2.0+(3.2-2.0)*eased_t,
+    if(lt(on,80),  3.2+(3.2-3.2)*t,           ← hold/dwell
+    if(lt(on,130), 3.2+(1.8-3.2)*eased_t,
+    1.8)))
+
+y = if(lt(on,50),  0.1*ih+(0.3*ih-0.1*ih)*eased_t,
+    if(lt(on,80),  0.3*ih,                     ← hold
+    if(lt(on,130), 0.3*ih+(0.7*ih-0.3*ih)*eased_t,
+    0.7*ih)))
+```
+
+Easing functions in FFmpeg expression syntax:
+- **Ease-out** (arriving): `1-pow(1-t, 2)` — decelerates into a stop
+- **Ease-in** (departing): `pow(t, 2)` — accelerates out of a stop  
+- **Smoothstep** (transition): `t*t*(3-2*t)` — smooth S-curve
+- **Hold**: constant value (no interpolation needed)
+
+The expressions are clamped to valid bounds:
+```
+x: max(0, min(x_expr, iw-iw/zoom))
+y: max(0, min(y_expr, ih-ih/zoom))
+```
+
+**5. Scroll Clip Renderer — `renderScrollClip()`**
+
+Wraps it all into a single FFmpeg call per strip:
+```
+scale=-2:3000 → zoompan(z=..., x=..., y=..., d=totalFrames, s=1080x1920)
+```
+
+> [!IMPORTANT]  
+> Scale height is increased from 2400→3000 for webtoon strips to preserve detail at high zoom levels (a 709×2058 image at 3.2× zoom needs ~3000px height to avoid pixelation at 1080p output).
+
+---
+
+### Camera Director Integration
+
+#### [MODIFY] [cameraDirector.js](file:///c:/Users/parvi/Documents/animereels/server/services/cameraDirector.js)
+
+Add format-aware dispatching:
+
+```diff
++import { isWebtoonStrip, analyzeWebtoonStrip } from './webtoonCamera.js';
++import sharp from 'sharp';
+
+ export async function detectFocusRegions(projectId, onProgress) {
+   // ... existing cache check ...
+   
+   for (let i = 0; i < images.length; i++) {
+     const imgPath = images[i];
++    const { width, height } = await sharp(imgPath).metadata();
++    
++    if (isWebtoonStrip(width, height)) {
++      // Webtoon path: interest points + scroll data
++      const scrollData = await analyzeWebtoonStrip(imgPath, imgFile);
++      focusMap[imgFile] = { 
++        regions: scrollData.interestPoints,
++        isWebtoon: true,
++        scrollPath: scrollData   // full scroll metadata
++      };
++    } else {
+       // Existing manga path
+       // ... current focus region detection ...
++    }
+   }
+ }
+```
+
+The `focusMap` entry gains an `isWebtoon: true` flag that the renderer checks.
+
+---
+
+### Video Renderer Integration  
+
+#### [MODIFY] [videoRenderer.js](file:///c:/Users/parvi/Documents/animereels/server/services/videoRenderer.js)
+
+In the camera clip generation loop (lines 378-419), add webtoon branch:
+
+```diff
++import { renderScrollClip } from './webtoonCamera.js';
+
+ // Inside the camera clip loop:
+ if (hasFocusData && pageFocus && pageExists) {
++  if (pageFocus.isWebtoon && pageFocus.scrollPath) {
++    // WEBTOON: continuous scroll clip
++    await renderScrollClip(
++      pagePath, 
++      pageFocus.scrollPath.interestPoints,
++      clipDuration, 
++      clipPath,
++      entry.mood
++    );
++  } else if (pageFocus.regions?.length > 0) {
+     // MANGA: multi-shot clip (existing)
+     await generateMultiShotClip(...);
++  }
+ }
+```
+
+---
+
+### Panel Splitter — Webtoon Mode
+
+#### [MODIFY] [panelSplitter.js](file:///c:/Users/parvi/Documents/animereels/server/services/panelSplitter.js)
+
+For webtoon strips, skip gutter-based splitting. Produce ONE "panel" per page (the full page acts as the unit):
+
+```diff
+ async function detectPanels(imagePath) {
+   const { width, height } = await image.metadata();
++  
++  // Webtoon strips: keep as single unit (camera scrolls through it)
++  if (height / width >= 2.0) {
++    return { 
++      panels: [{ x: 0, y: 0, w: width, h: height }], 
++      width, height,
++      isWebtoon: true 
++    };
++  }
+   
+   // ... existing gutter detection for manga ...
+ }
+```
+
+This means timeline builder gets 1 entry per webtoon page (longer duration) instead of 3-4 sub-panels (shorter durations). Each entry gets enough time for a meaningful scroll-through.
+
+---
+
+### Timeline Builder Awareness
+
+#### [MODIFY] [timelineBuilder.js](file:///c:/Users/parvi/Documents/animereels/server/services/timelineBuilder.js)
+
+No major changes needed. When panelSplitter produces 1 panel per webtoon page, the timeline builder naturally allocates more time per entry. A 67-page chapter with 1 panel/page at 5 minutes = ~4.5s per page — perfect for a scroll-through.
+
+Minor addition: pass `isWebtoon` flag through to timeline entries so the renderer can check it.
+
+---
+
+## Edge Cases Handled
+
+| Scenario | How it's handled |
+|---|---|
+| **Mixed format chapter** (some manga pages, some webtoon strips) | Per-page detection via `isWebtoonStrip()` — each page takes the right path |
+| **Very tall strips** (ratio > 4:1) | More interest points requested, slower scroll speed |
+| **Strip with few interesting areas** | `buildScrollPath` injects synthetic waypoints to ensure smooth coverage |
+| **Very short clip duration** (< 2s for a strip) | Falls back to single zoom on highest-importance point |
+| **No AI available** | Default scroll path: top→middle→bottom with uniform zoom 2.0 |
+| **Seamless art (no gutters)** | This is the NORM for webtoon — our system doesn't need gutters at all |
+
+---
+
+## Verification Plan
+
+### Automated Tests
+1. Run `node -e "..."` test script to verify:
+   - `isWebtoonStrip(709, 2058)` returns `true`
+   - `isWebtoonStrip(1000, 1400)` returns `false`  
+   - `buildScrollPath()` produces valid keyframes from mock interest points
+   - `buildZoompanExpression()` produces syntactically valid FFmpeg expressions
+
+2. Render a test clip from one of the Pick Me Up sample images:
+   ```
+   node test-webtoon-scroll.js "C:/Users/parvi/Documents/trial3/Pick Me Up/Ch.0001/.../01.png"
+   ```
+   Verify output is 1080×1920 with smooth vertical scrolling.
+
+### Manual Verification
+- Upload Pick Me Up chapter to AnimeReels, run through full pipeline
+- Verify the rendered video shows smooth scroll-through with zoom highlights on faces/action
+- Compare against current output (choppy multi-shot cuts)
+
+---
+
+## Open Questions
+
+> [!IMPORTANT]
+> **Transition style between strips**: When the video moves from one webtoon strip (page) to the next, should it:
+> - **Hard cut** (instant switch) — simplest, most common in recap videos
+> - **Cross-dissolve** (0.3s fade) — smoother but adds complexity
+> - **Matched scroll** (exit bottom of strip A → enter top of strip B as continuous scroll) — most immersive but technically complex
+>
+> Current pipeline uses hard cuts between clips. Recommend keeping hard cuts for now, adding cross-dissolve as a future enhancement.
+
+> [!NOTE]  
+> **Scale height tuning**: The upscale target (3000px) may need adjustment based on testing. Higher = better quality at high zoom but slower FFmpeg processing. We can make this configurable via `detailPresets.js`.

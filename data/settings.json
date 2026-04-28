@@ -1,0 +1,10 @@
+{
+  "visionBackend": "gemini",
+  "ollamaModel": "gemma4:e4b",
+  "ollamaBaseUrl": "http://localhost:11434",
+  "geminiModel": "gemini-2.5-flash",
+  "textBackend": "gemini",
+  "ollamaTextModel": "gemma4:e4b",
+  "groqVisionModel": "meta-llama/llama-4-scout-17b-16e-instruct",
+  "groqTextModel": "llama-3.3-70b-versatile"
+}

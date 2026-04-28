@@ -1,0 +1,331 @@
+# Webtoon Scroll Camera System
+
+## The Core Problem
+
+Manhwa/webtoon images are tall vertical strips (~709×2058, ratio ≈ 1:3). The current pipeline was designed for manga layouts:
+
+| Current Pipeline Step | What it assumes | What webtoon actually needs |
+|---|---|---|
+| **panelSplitter** | Clear gutters (black/white lines) separate panels | Seamless artwork, no gutters — art flows continuously |
+| **cameraDirector** | Independent focus regions to zoom into | A **scroll path** — camera flows top→bottom through the strip |
+| **videoRenderer** (multi-shot) | Cut between static zoom shots | **Continuous smooth motion** — scroll + zoom + pause |
+| **Ken Burns fallback** | Center-crop + slight zoom | Misses 60%+ of the strip content |
+
+The fundamental mismatch: **manga is a grid of independent panels; webtoon is a single continuous vertical canvas**. We need a completely different camera system for the webtoon format, toggled by the user.
+
+---
+
+## Proposed Changes
+
+### 1. Format Toggle — Frontend
+
+The user picks **Manga** or **Manhwa/Webtoon** when creating or configuring a project. This is a simple toggle in three places:
+
+#### [MODIFY] [RenderSettings.jsx](file:///c:/Users/parvi/Documents/animereels/client/src/components/RenderSettings.jsx)
+
+Add a **Format Type** toggle section at the top, before Duration/Detail:
+
+```jsx
+const FORMAT_OPTIONS = [
+  {
+    value: 'manga',
+    label: '📖 Manga',
+    description: 'Grid layout with distinct panels. Camera zooms into each panel.',
+  },
+  {
+    value: 'webtoon',
+    label: '📱 Manhwa / Webtoon',
+    description: 'Tall vertical strips. Camera scrolls top-to-bottom with zoom highlights.',
+  },
+];
+```
+
+Uses the same `detailCard` / `detailCardActive` styling already in place for the Detail Level selector — visually consistent, zero new CSS needed.
+
+Adds `format` + `onFormatChange` props alongside the existing `duration` / `detail` props.
+
+---
+
+#### [MODIFY] [ProjectWizard.jsx](file:///c:/Users/parvi/Documents/animereels/client/src/pages/ProjectWizard.jsx)
+
+- New state: `const [renderFormat, setRenderFormat] = useState('manga');`
+- Restore from `project.config.format` on load (like duration/detail)
+- Persist via `patch(/projects/${id}/config, { format })` on change
+- Pass to `<RenderSettings format={renderFormat} onFormatChange={...} />`
+- Pass to render API call: `post(/projects/${id}/render, { duration, detail, format })`
+
+---
+
+### 2. Backend Config — Persist & Pass Through
+
+#### [MODIFY] [projects.js](file:///c:/Users/parvi/Documents/animereels/server/routes/projects.js)
+
+- Add `format: 'manga'` to default `config` in `createProject()` (line 28 area)
+- Allow `format` in the `PATCH /:id/config` handler — accept `'manga'` or `'webtoon'`
+
+#### [MODIFY] [render.js](file:///c:/Users/parvi/Documents/animereels/server/routes/render.js)
+
+- Read `req.body.format` and pass it into `renderVideo()` via `renderConfig`
+
+---
+
+### 3. Webtoon Camera Service — The Engine
+
+#### [NEW] [webtoonCamera.js](file:///c:/Users/parvi/Documents/animereels/server/services/webtoonCamera.js)
+
+The core new service with five subsystems:
+
+**3a. AI Strip Analysis — Webtoon-Specific Gemini Prompt**
+
+The current `cameraDirector.js` prompt asks for "focus regions" (bounding boxes). For webtoon strips we need **interest points along the vertical axis** with importance scores:
+
+```
+You are analyzing a vertical manhwa/webtoon strip image.
+This is a TALL image read by scrolling top-to-bottom.
+
+Identify 4-7 KEY MOMENTS along the vertical scroll.
+For each moment provide:
+- y_center: vertical position (0.0=top, 1.0=bottom)
+- x_center: horizontal center of interest (0.0=left, 1.0=right)
+- importance: 1-5 (5=most dramatic — face closeup, action impact)
+- type: "face_closeup" | "action_impact" | "dialogue" |
+        "reveal" | "scenery" | "transition"
+- zoom: "tight" | "medium" | "wide"
+- label: brief description
+
+RULES:
+- Cover the FULL strip top-to-bottom
+- At minimum: one point in top 25%, one in middle, one in bottom 25%
+- Character FACES → importance 4-5, zoom "tight"
+- Action impacts → importance 4-5, zoom "medium"  
+- Dialogue/talking → importance 3, zoom "medium"
+- Scene transitions/scenery → importance 1-2, zoom "wide"
+- Skip title cards, credits, logos entirely
+- Points MUST be in top-to-bottom order
+```
+
+**3b. Scroll Path Planner — `buildScrollPath()`**
+
+Given interest points + duration, produces a keyframe array:
+
+```
+Algorithm:
+  1. Sort points by y_center (top to bottom)
+  2. Gap coverage: inject synthetic waypoints if gap between consecutive
+     points exceeds 30% of strip height
+  3. Time allocation:
+     - For each point: dwell_time = base × (0.5 + importance/5)
+       → importance 5 = 1.5× base dwell, importance 1 = 0.7×
+     - Remaining time = scroll transitions, speed ∝ distance
+  4. Generate keyframes:
+     [Arrive] ease-out → [Dwell] hold + subtle 5% zoom bump → [Leave] ease-in
+  5. Zoom levels:
+     tight → 3.2 | medium → 2.4 | wide → 1.8
+```
+
+**3c. FFmpeg Expression Generator — `buildZoompanExpression()`**
+
+Converts keyframes into piecewise zoompan expressions. For N keyframes, builds nested `if(lt(on, frame), lerp, ...)` expressions:
+
+```
+z = if(lt(on,50),  2.0+(3.2-2.0)*eased_t,
+    if(lt(on,80),  3.2,                      ← hold/dwell
+    if(lt(on,130), 3.2+(1.8-3.2)*eased_t,
+    1.8)))
+```
+
+Easing in FFmpeg expression syntax:
+- Ease-out (arriving): `1-pow(1-t, 2)`
+- Ease-in (departing): `pow(t, 2)`  
+- Smoothstep: `t*t*(3-2*t)`
+
+All values clamped to valid bounds:
+```
+x: max(0, min(x_expr, iw-iw/zoom))
+y: max(0, min(y_expr, ih-ih/zoom))
+```
+
+**3d. Scroll Clip Renderer — `renderScrollClip()`**
+
+Single FFmpeg call per strip:
+```
+scale=-2:3000 → zoompan(z=..., x=..., y=..., d=frames, s=1080x1920, fps=25) → setsar=1
+```
+
+Scale target: 3000px height (up from 2400) for webtoon strips to prevent pixelation at 3.2× zoom.
+
+**3e. Fallback Scroll Path**
+
+When AI analysis fails, generates a default top→mid→bottom scroll:
+```js
+function defaultScrollPath(duration) {
+  return [
+    { y: 0.12, x: 0.5, zoom: 2.0, importance: 3 },  // top
+    { y: 0.50, x: 0.5, zoom: 2.2, importance: 3 },  // middle
+    { y: 0.88, x: 0.5, zoom: 2.0, importance: 3 },  // bottom
+  ];
+}
+```
+
+---
+
+### 4. Camera Director — Format-Aware Dispatch
+
+#### [MODIFY] [cameraDirector.js](file:///c:/Users/parvi/Documents/animereels/server/services/cameraDirector.js)
+
+Add a `format` parameter. When `format === 'webtoon'`, use the webtoon analysis instead of focus region detection:
+
+```diff
+-export async function detectFocusRegions(projectId, onProgress) {
++export async function detectFocusRegions(projectId, onProgress, format = 'manga') {
+
+   for (let i = 0; i < images.length; i++) {
++    if (format === 'webtoon') {
++      const scrollData = await analyzeWebtoonStrip(imgPath);
++      focusMap[imgFile] = {
++        regions: scrollData.interestPoints,
++        isWebtoon: true,
++        scrollPath: scrollData,
++      };
++    } else {
+       // existing manga focus region detection
++    }
+   }
+```
+
+---
+
+### 5. Video Renderer — Scroll Clip Branch  
+
+#### [MODIFY] [videoRenderer.js](file:///c:/Users/parvi/Documents/animereels/server/services/videoRenderer.js)
+
+**Two changes:**
+
+1. Pass `format` from `renderConfig` into `detectFocusRegions()`:
+```diff
+- focusRegions = await detectFocusRegions(projectId, ...);
++ const format = renderConfig.format || 'manga';
++ focusRegions = await detectFocusRegions(projectId, ..., format);
+```
+
+2. In the camera clip loop, add webtoon branch:
+```diff
++import { renderScrollClip } from './webtoonCamera.js';
+
+ if (hasFocusData && pageFocus && pageExists) {
++  if (pageFocus.isWebtoon && pageFocus.scrollPath) {
++    await renderScrollClip(pagePath, pageFocus.scrollPath, clipDuration, clipPath, entry.mood);
++  } else if (pageFocus.regions?.length > 0) {
+     await generateMultiShotClip(...);  // existing manga path
++  }
+ }
+```
+
+---
+
+### 6. Panel Splitter — Webtoon Mode
+
+#### [MODIFY] [panelSplitter.js](file:///c:/Users/parvi/Documents/animereels/server/services/panelSplitter.js)
+
+For webtoon format, keep each page as a single unit (no gutter splitting):
+
+```diff
+-export async function splitAllChapters(projectId, onProgress) {
++export async function splitAllChapters(projectId, onProgress, format = 'manga') {
+
+   for (let i = 0; i < images.length; i++) {
+-    const { panels, width, height } = await detectPanels(imgPath);
++    let result;
++    if (format === 'webtoon') {
++      const { width, height } = await sharp(imgPath).metadata();
++      result = { panels: [{ x: 0, y: 0, w: width, h: height }], width, height };
++    } else {
++      result = await detectPanels(imgPath);
++    }
++    const { panels, width, height } = result;
+```
+
+This means timeline builder gets **1 panel per page** for webtoon → longer duration per entry → enough time for a meaningful scroll-through (~4-5s per page for a 67-page chapter at 5 min).
+
+---
+
+### 7. Upload Route — Pass Format to Splitter
+
+#### [MODIFY] [upload.js](file:///c:/Users/parvi/Documents/animereels/server/routes/upload.js) 
+
+Read `project.config.format` and pass it to `splitAllChapters()`.
+
+#### [MODIFY] [panels.js](file:///c:/Users/parvi/Documents/animereels/server/routes/panels.js)
+
+Same — pass format to both `splitAllChapters()` and `detectAllPanels()`.
+
+---
+
+## Architecture Flow (Both Paths)
+
+```mermaid
+flowchart TD
+    U["User uploads chapter images"] --> T{"Format Toggle<br/>in RenderSettings"}
+    T -->|"📖 Manga"| M1["panelSplitter<br/>gutter detection → 3-4 panels/page"]
+    T -->|"📱 Webtoon"| W1["panelSplitter<br/>keep full page → 1 panel/page"]
+    
+    M1 --> TL["Timeline Builder<br/>maps panels to narration time"]
+    W1 --> TL
+    
+    TL --> R{"Render Loop<br/>per timeline entry"}
+    
+    R -->|"Manga"| M2["cameraDirector<br/>focus regions prompt"]
+    M2 --> M3["generateMultiShotClip<br/>zoom into each region"]
+    
+    R -->|"Webtoon"| W2["webtoonCamera<br/>scroll analysis prompt"]
+    W2 --> W3["buildScrollPath<br/>keyframes with easing"]
+    W3 --> W4["buildZoompanExpression<br/>piecewise FFmpeg expr"]
+    W4 --> W5["renderScrollClip<br/>single continuous FFmpeg call"]
+    
+    M3 --> C["Concat → Audio Mix → Subtitles → final.mp4"]
+    W5 --> C
+```
+
+---
+
+## Files Summary
+
+| File | Action | What Changes |
+|---|---|---|
+| `client/src/components/RenderSettings.jsx` | MODIFY | Add Format Type toggle (Manga / Webtoon) |
+| `client/src/pages/ProjectWizard.jsx` | MODIFY | State + persist + pass format through |
+| `server/routes/projects.js` | MODIFY | `format` in default config + PATCH handler |
+| `server/routes/render.js` | MODIFY | Pass `format` into renderVideo |
+| `server/routes/upload.js` | MODIFY | Pass format to splitter |
+| `server/routes/panels.js` | MODIFY | Pass format to splitter/detector |
+| `server/services/webtoonCamera.js` | **NEW** | AI analysis, scroll path, expression gen, renderer |
+| `server/services/cameraDirector.js` | MODIFY | Format-aware dispatch |
+| `server/services/videoRenderer.js` | MODIFY | Scroll clip branch for webtoon |
+| `server/services/panelSplitter.js` | MODIFY | Skip splitting for webtoon format |
+
+---
+
+## Verification Plan
+
+### Automated Tests
+1. Unit test: `buildScrollPath()` with mock interest points → valid keyframes
+2. Unit test: `buildZoompanExpression()` → syntactically valid FFmpeg expression strings
+3. Integration test: render a single Pick Me Up strip with the scroll camera → verify 1080×1920 output with smooth scroll
+
+### Manual Verification  
+- Create a project, toggle to "Manhwa / Webtoon" mode
+- Upload Pick Me Up chapter images
+- Run full pipeline → verify video shows smooth vertical scrolling with zoom highlights
+- Toggle back to "Manga" mode → verify existing pipeline still works
+
+---
+
+## Open Questions
+
+> [!IMPORTANT]
+> **Toggle placement**: The format toggle is in `RenderSettings.jsx` which appears in both the Script step and Render step. Should it also appear in the Upload step (since it affects panel splitting)? Or should we re-split panels when format changes?
+> 
+> **Recommendation**: Show the toggle in Upload step too, and re-trigger panel splitting when format changes.
+
+> [!NOTE]
+> **Cross-page transitions**: Currently hard cuts between pages. Smooth cross-dissolves between webtoon strips would be a nice future enhancement but not needed for v1.
