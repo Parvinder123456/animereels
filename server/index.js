@@ -15,6 +15,8 @@ import panelsRouter from './routes/panels.js';
 import scriptRouter from './routes/script.js';
 import voiceRouter from './routes/voice.js';
 import renderRouter from './routes/render.js';
+import videoSummaryRouter from './routes/videoSummary.js';
+import translateRouter from './routes/translate.js';
 import eventsRouter from './routes/events.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { logger } from './utils/logger.js';
@@ -46,8 +48,10 @@ app.use('/api/projects', panelsRouter);
 app.use('/api/projects', scriptRouter);
 app.use('/api/projects', voiceRouter);
 app.use('/api/projects', renderRouter);
+app.use('/api/projects', videoSummaryRouter);
 
 app.use('/api/youtube', youtubeRouter);
+app.use('/api/translate', translateRouter);
 app.use('/api/series', seriesRouter);
 
 // Serve built React app in production

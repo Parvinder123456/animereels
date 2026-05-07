@@ -21,6 +21,8 @@ const DEFAULTS = {
   ollamaTextModel: process.env.OLLAMA_TEXT_MODEL || 'gemma4:e4b',
   groqVisionModel: process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct',
   groqTextModel:   process.env.GROQ_TEXT_MODEL   || 'llama-3.3-70b-versatile',
+  deepseekTextModel: process.env.DEEPSEEK_TEXT_MODEL || 'deepseek-v4-flash',
+  deepseekBaseUrl:   process.env.DEEPSEEK_BASE_URL   || 'https://api.deepseek.com',
 };
 
 let _cache = null;

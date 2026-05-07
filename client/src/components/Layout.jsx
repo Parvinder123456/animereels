@@ -61,6 +61,7 @@ function BackendOption({ name, subtitle, active, color, onClick, saving }) {
 }
 
 function BackendSection({ label, current, onSwitch, saving, settings }) {
+  const isText = label === 'Text AI';
   return (
     <>
       <div style={{ padding: '8px 12px 4px', fontSize: '10px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.8px' }}>
@@ -75,14 +76,25 @@ function BackendSection({ label, current, onSwitch, saving, settings }) {
       <div style={{ height: '1px', background: 'var(--glass-border)', margin: '0 8px' }} />
       <BackendOption
         name="Groq Cloud"
-        subtitle={`${label === 'Vision AI' ? settings.groq.visionModel.split('/').pop() : settings.groq.textModel} · ${settings.groq.hasApiKey ? 'key set' : 'no key'}`}
+        subtitle={`${isText ? settings.groq.textModel : settings.groq.visionModel.split('/').pop()} · ${settings.groq.hasApiKey ? 'key set' : 'no key'}`}
         active={current === 'groq'} color="#f97316"
         onClick={() => onSwitch('groq')} saving={saving}
       />
+      {isText && settings.deepseek && (
+        <>
+          <div style={{ height: '1px', background: 'var(--glass-border)', margin: '0 8px' }} />
+          <BackendOption
+            name="DeepSeek Cloud"
+            subtitle={`${settings.deepseek.textModel} · ${settings.deepseek.hasApiKey ? 'key set' : 'no key'}`}
+            active={current === 'deepseek'} color="#3b82f6"
+            onClick={() => onSwitch('deepseek')} saving={saving}
+          />
+        </>
+      )}
       <div style={{ height: '1px', background: 'var(--glass-border)', margin: '0 8px' }} />
       <BackendOption
         name="Local (Ollama)"
-        subtitle={`${label === 'Vision AI' ? settings.ollama.model : settings.ollama.textModel} · no filters`}
+        subtitle={`${isText ? settings.ollama.textModel : settings.ollama.model} · no filters`}
         active={current === 'ollama'} color="#34d399"
         onClick={() => onSwitch('ollama')} saving={saving}
       />

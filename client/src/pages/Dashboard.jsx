@@ -1,6 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { get, post, del } from '../api/client.js';
+import { get, post, patch, del } from '../api/client.js';
+
+const PROJECT_TYPES = [
+  { value: 'manga',         label: 'Manga / Manhwa',     subtitle: 'Upload chapter images.',                       icon: '\u{1F4D6}' },
+  { value: 'video_summary', label: 'Video Summary',      subtitle: 'Upload an anime episode → narrated recap.',    icon: '\u{1F3AC}' },
+  { value: 'translate',     label: 'YouTube Hindi → EN', subtitle: 'Paste a Hindi YouTube URL → English clip.',    icon: '\u{1F310}' },
+];
 
 const styles = {
   page: {
@@ -227,6 +233,9 @@ export default function Dashboard() {
   const [error, setError] = useState(null);
   const [showModal, setShowModal] = useState(false);
   const [newName, setNewName] = useState('');
+  const [newType, setNewType] = useState('manga');
+  const [newUrl, setNewUrl] = useState('');
+  const [newTopic, setNewTopic] = useState('');
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState(null);
 
@@ -248,19 +257,48 @@ export default function Dashboard() {
   }
 
   async function handleCreate() {
-    if (!newName.trim()) return;
     setCreating(true);
     setCreateError(null);
     try {
+      if (newType === 'translate') {
+        if (!newUrl.trim()) throw new Error('YouTube URL is required');
+        const { id } = await post('/translate', {
+          name: newName.trim() || undefined,
+          url: newUrl.trim(),
+          topic: newTopic.trim() || undefined,
+        });
+        setShowModal(false);
+        resetModal();
+        navigate(`/projects/${id}/translate`);
+        return;
+      }
+
+      if (!newName.trim()) throw new Error('Project name is required');
       const project = await post('/projects', { name: newName.trim() });
+
+      if (newType === 'video_summary') {
+        await patch(`/projects/${project.id}/config`, { projectType: 'video_summary' });
+        setShowModal(false);
+        resetModal();
+        navigate(`/projects/${project.id}/video`);
+        return;
+      }
+
       setShowModal(false);
-      setNewName('');
+      resetModal();
       navigate(`/projects/${project.id}`);
     } catch (e) {
       setCreateError(e.message);
     } finally {
       setCreating(false);
     }
+  }
+
+  function resetModal() {
+    setNewName('');
+    setNewUrl('');
+    setNewTopic('');
+    setNewType('manga');
   }
 
   async function handleDelete(project) {
@@ -274,15 +312,22 @@ export default function Dashboard() {
   }
 
   function handleCardClick(project) {
+    const type = project.config?.projectType;
     if (project.state?.render === 'complete') {
       navigate(`/projects/${project.id}/detail`);
+      return;
+    }
+    if (type === 'video_summary') {
+      navigate(`/projects/${project.id}/video`);
+    } else if (type === 'translate') {
+      navigate(`/projects/${project.id}/translate`);
     } else {
       navigate(`/projects/${project.id}`);
     }
   }
 
   function openModal() {
-    setNewName('');
+    resetModal();
     setCreateError(null);
     setShowModal(true);
   }
@@ -337,16 +382,79 @@ export default function Dashboard() {
             <div style={styles.modalTitle}>New Project</div>
 
             <div>
-              <label>Project Name</label>
-              <input
-                type="text"
-                placeholder="e.g. One Piece Chapter 1050"
-                value={newName}
-                onChange={e => setNewName(e.target.value)}
-                onKeyDown={handleModalKeyDown}
-                autoFocus
-              />
+              <label style={{ display: 'block', marginBottom: 8, fontSize: 12, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                Project Type
+              </label>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {PROJECT_TYPES.map(t => (
+                  <button
+                    key={t.value}
+                    type="button"
+                    onClick={() => setNewType(t.value)}
+                    style={{
+                      display: 'flex', alignItems: 'flex-start', gap: 12, padding: '10px 12px',
+                      borderRadius: 8, textAlign: 'left',
+                      border: `1px solid ${newType === t.value ? 'var(--accent-purple)' : 'var(--glass-border)'}`,
+                      background: newType === t.value ? 'rgba(139,92,246,0.10)' : 'transparent',
+                      color: 'var(--text-primary)', cursor: 'pointer',
+                    }}
+                  >
+                    <span style={{ fontSize: 20 }}>{t.icon}</span>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                      <span style={{ fontSize: 13, fontWeight: 600 }}>{t.label}</span>
+                      <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t.subtitle}</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
             </div>
+
+            {newType !== 'translate' && (
+              <div>
+                <label>Project Name</label>
+                <input
+                  type="text"
+                  placeholder={newType === 'manga' ? 'e.g. One Piece Chapter 1050' : 'e.g. Naruto Episode 133 Recap'}
+                  value={newName}
+                  onChange={e => setNewName(e.target.value)}
+                  onKeyDown={handleModalKeyDown}
+                  autoFocus
+                />
+              </div>
+            )}
+
+            {newType === 'translate' && (
+              <>
+                <div>
+                  <label>YouTube URL</label>
+                  <input
+                    type="url"
+                    placeholder="https://www.youtube.com/watch?v=..."
+                    value={newUrl}
+                    onChange={e => setNewUrl(e.target.value)}
+                    autoFocus
+                  />
+                </div>
+                <div>
+                  <label>Topic (optional)</label>
+                  <input
+                    type="text"
+                    placeholder="e.g. AI in education — leave blank for first 3 min"
+                    value={newTopic}
+                    onChange={e => setNewTopic(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <label>Project Name (optional)</label>
+                  <input
+                    type="text"
+                    placeholder="defaults to the video title"
+                    value={newName}
+                    onChange={e => setNewName(e.target.value)}
+                  />
+                </div>
+              </>
+            )}
 
             {createError && <div style={styles.errorBanner}>{createError}</div>}
 

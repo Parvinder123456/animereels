@@ -5,6 +5,8 @@ import { validateProject } from '../middleware/validateProject.js';
 import { safeWriteJson, projectPath, fileExists } from '../utils/fileHelpers.js';
 import { runJob, emit, isRunning } from '../jobs/processor.js';
 import { renderVideo } from '../services/videoRenderer.js';
+import { renderVideoSummary } from '../services/videoSummaryRenderer.js';
+import { renderTranslatedClip } from '../services/translatedRenderer.js';
 import { logger } from '../utils/logger.js';
 
 const router = Router();
@@ -47,10 +49,18 @@ router.post('/:id/render', validateProject, async (req, res, next) => {
         await safeWriteJson(projectPath(req.params.id, 'project.json'), project);
         logger.info(`[render] Project state set to "processing", calling renderVideo...`);
 
-        await renderVideo(req.params.id, (message, percent) => {
+        const projectType = project.config?.projectType || 'manga';
+        const onProgress = (message, percent) => {
           logger.info(`[render] Progress: ${percent}% — ${message}`);
           emit(req.params.id, 'render', message, percent);
-        }, renderConfig);
+        };
+        if (projectType === 'video_summary') {
+          await renderVideoSummary(req.params.id, onProgress);
+        } else if (projectType === 'translate') {
+          await renderTranslatedClip(req.params.id, onProgress);
+        } else {
+          await renderVideo(req.params.id, onProgress, renderConfig);
+        }
 
         project.state.render = 'complete';
         project.updatedAt = new Date().toISOString();

@@ -29,7 +29,8 @@ function createProject(name) {
       videoResolution: '1920x1080',
       duration: 60,
       detail: 'medium',
-      format: 'manga'
+      format: 'manga',
+      projectType: 'manga'
     },
     stats: {
       chapterCount: 0,
@@ -96,7 +97,7 @@ router.patch('/:id/config', async (req, res, next) => {
     const proj = await safeReadJson(projectPath(req.params.id, 'project.json'));
     if (!proj) return res.status(404).json({ error: 'Project not found' });
 
-    const { duration, detail, format } = req.body;
+    const { duration, detail, format, projectType } = req.body;
     proj.config = proj.config || {};
     if (duration !== undefined && typeof duration === 'number' && duration > 0) {
       proj.config.duration = duration;
@@ -106,6 +107,9 @@ router.patch('/:id/config', async (req, res, next) => {
     }
     if (format !== undefined && ['manga', 'webtoon'].includes(format)) {
       proj.config.format = format;
+    }
+    if (projectType !== undefined && ['manga', 'webtoon', 'video_summary', 'translate'].includes(projectType)) {
+      proj.config.projectType = projectType;
     }
     proj.updatedAt = new Date().toISOString();
     await safeWriteJson(projectPath(req.params.id, 'project.json'), proj);
