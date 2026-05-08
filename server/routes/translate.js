@@ -203,7 +203,133 @@ router.post('/:id/manual-transcript', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ─── POST /api/translate/:id/manual-script ──────────────────────────────────
+// Skips Whisper AND the DeepSeek translation step entirely. The user
+// pastes an already-English narration script (e.g. produced by the Gemini
+// consumer mobile app) and we write it directly to script.json.
+
+router.post('/:id/manual-script', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { script: scriptIn, startSec, endSec } = req.body || {};
+    if (!scriptIn) return res.status(400).json({ error: 'script (string or object) is required' });
+
+    const project = await safeReadJson(projectPath(id, 'project.json'));
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+
+    if (isRunning(id)) return res.status(409).json({ error: 'Job already running' });
+
+    const sourcePath = projectPath(id, 'source.mp4');
+    const sourceDuration = await probeDuration(sourcePath);
+    if (sourceDuration <= 0) {
+      return res.status(400).json({ error: 'Source video missing or unreadable — wait for download to finish' });
+    }
+
+    const window = {
+      startSec: Math.max(0, Number(startSec) || 0),
+      endSec:   Math.min(sourceDuration, Number(endSec) || Math.min(sourceDuration, 180)),
+    };
+    if (window.endSec <= window.startSec) {
+      return res.status(400).json({ error: `endSec (${window.endSec}) must be greater than startSec (${window.startSec})` });
+    }
+
+    const script = parseEnglishScript(scriptIn, window);
+    if (!script.segments.length) return res.status(400).json({ error: 'Script parsed to zero segments' });
+    script.sourceWindow = window;
+    script.sourceLanguage = 'manual';
+
+    await safeWriteJson(projectPath(id, 'script.json'), script);
+    await safeWriteJson(projectPath(id, 'translate-window.json'), { window, topic: null });
+
+    project.state.panels = 'complete';
+    project.state.script = 'complete';
+    project.config.duration = Math.round(window.endSec - window.startSec);
+    project.stats.panelCount = 1;
+    project.stats.scriptWordCount = script.segments.reduce(
+      (n, s) => n + (s.text ? s.text.split(/\s+/).filter(Boolean).length : 0), 0
+    );
+    project.updatedAt = new Date().toISOString();
+    await safeWriteJson(projectPath(id, 'project.json'), project);
+    emit(id, 'script', `Manual English script accepted (${script.segments.length} segments)`, 100);
+
+    res.json({ success: true, segments: script.segments.length, window });
+  } catch (err) { next(err); }
+});
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Accept either:
+ *   - a JSON object  { title, hook?, segments: [{text, mood?}] }
+ *   - a JSON array   [{text, mood?}, ...]
+ *   - plain English text — auto-segmented across the window by sentence
+ *
+ * Returns { title, hook, segments: [{text, mood, sourceStart, sourceEnd}] }
+ * with timestamps interpolated linearly across the source window so the
+ * existing renderer (which uses sourceStart/sourceEnd) Just Works.
+ */
+function parseEnglishScript(input, window) {
+  const span = window.endSec - window.startSec;
+
+  let title = 'Translated Clip';
+  let hook = '';
+  let raw = [];
+
+  if (typeof input === 'string') {
+    const trimmed = input.trim();
+    const looksJson = trimmed.startsWith('{') || trimmed.startsWith('[');
+    if (looksJson) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) raw = parsed;
+        else { title = parsed.title || title; hook = parsed.hook || ''; raw = parsed.segments || []; }
+      } catch {
+        // fall through to plain-text path
+      }
+    }
+    if (!raw.length) {
+      const sentences = trimmed
+        .replace(/\r/g, '')
+        .split(/(?<=[\.\?!])\s+|\n{2,}/)
+        .map(s => s.trim())
+        .filter(Boolean);
+      raw = sentences.map(text => ({ text, mood: 'calm' }));
+    }
+  } else if (Array.isArray(input)) {
+    raw = input;
+  } else if (input && typeof input === 'object') {
+    title = input.title || title;
+    hook  = input.hook  || '';
+    raw   = input.segments || [];
+  }
+
+  const cleaned = raw
+    .map(s => ({
+      text: String(s.text || s.english || s.content || '').trim(),
+      mood: String(s.mood || 'calm').toLowerCase(),
+    }))
+    .filter(s => s.text);
+  if (!cleaned.length) return { title, hook, segments: [] };
+
+  const totalChars = cleaned.reduce((n, s) => n + s.text.length, 0);
+  let cursor = window.startSec;
+  const segments = cleaned.map((s, i) => {
+    const share = (s.text.length / totalChars) * span;
+    const sourceStart = cursor;
+    const sourceEnd = i === cleaned.length - 1 ? window.endSec : cursor + share;
+    cursor = sourceEnd;
+    return {
+      sourceSegmentId: i,
+      sourceStart: +sourceStart.toFixed(3),
+      sourceEnd:   +sourceEnd.toFixed(3),
+      text: s.text,
+      mood: s.mood,
+    };
+  });
+
+  return { title, hook, segments };
+}
+
 
 async function runWindowAndTranslate(project, transcript, topic, language, onStep) {
   let window = null;

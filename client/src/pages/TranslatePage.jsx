@@ -34,7 +34,7 @@ const VOICES = [
   { id: 'en-US-ChristopherNeural', label: 'Christopher — Authoritative' },
 ];
 
-const GEMINI_PROMPT = `Transcribe the attached audio. Return ONLY valid JSON in this shape, no prose, no code fence:
+const HINDI_PROMPT = `Transcribe the attached audio. Return ONLY valid JSON in this shape, no prose, no code fence:
 
 {
   "language": "hi",
@@ -47,6 +47,19 @@ const GEMINI_PROMPT = `Transcribe the attached audio. Return ONLY valid JSON in 
 
 Rules: break at natural pauses (5-15s per segment), cover the whole audio, transcribe verbatim in the original language, do not translate.`;
 
+const ENGLISH_PROMPT = `Listen to the attached audio (Hindi or Hinglish) and produce a tight English narration script that summarizes what is said in roughly the same spoken length (~2.3 words/sec). Return ONLY valid JSON in this shape, no prose, no code fence:
+
+{
+  "title": "<short English title>",
+  "hook":  "<one-sentence English hook>",
+  "segments": [
+    { "text": "<English line>", "mood": "calm|dramatic|emotional|comedic|reveal|suspense" },
+    { "text": "...",            "mood": "..." }
+  ]
+}
+
+Rules: 1 segment per ~10 seconds of audio, in chronological order. Idiomatic English — do not transliterate. Mood reflects the speaker's tone in that part. Output ONLY the JSON object.`;
+
 export default function TranslatePage() {
   const { id } = useParams();
   const progress = useSSE(id);
@@ -56,6 +69,9 @@ export default function TranslatePage() {
   const [voiceId, setVoiceId] = useState(VOICES[0].id);
   const [engine, setEngine] = useState('edge');
   const [transcriptText, setTranscriptText] = useState('');
+  const [manualMode, setManualMode] = useState('english'); // 'hindi' | 'english'
+  const [windowStart, setWindowStart] = useState(0);
+  const [windowEnd, setWindowEnd] = useState(180);
 
   useEffect(() => {
     reload();
@@ -68,18 +84,27 @@ export default function TranslatePage() {
     catch (e) { setError(e.message); }
   }
 
-  async function submitManualTranscript() {
-    if (!transcriptText.trim()) return setError('Paste a transcript first');
+  async function submitManual() {
+    if (!transcriptText.trim()) return setError('Paste your transcript or script first');
     setError(null); setBusy(true);
     try {
-      await post(`/translate/${id}/manual-transcript`, { transcript: transcriptText, format: 'auto' });
+      if (manualMode === 'english') {
+        await post(`/translate/${id}/manual-script`, {
+          script: transcriptText,
+          startSec: Number(windowStart) || 0,
+          endSec:   Number(windowEnd)   || 180,
+        });
+      } else {
+        await post(`/translate/${id}/manual-transcript`, { transcript: transcriptText, format: 'auto' });
+      }
       await reload();
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
   }
 
   function copyPrompt() {
-    navigator.clipboard?.writeText(GEMINI_PROMPT).catch(() => {});
+    const prompt = manualMode === 'english' ? ENGLISH_PROMPT : HINDI_PROMPT;
+    navigator.clipboard?.writeText(prompt).catch(() => {});
   }
 
   async function generateVoice() {
@@ -167,16 +192,56 @@ export default function TranslatePage() {
                 </details>
                 {!scriptDone && (
                   <>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button
+                        type="button"
+                        onClick={() => setManualMode('english')}
+                        style={{
+                          flex: 1, padding: '8px 12px', borderRadius: 8,
+                          border: `1px solid ${manualMode === 'english' ? 'var(--accent-purple)' : 'var(--glass-border)'}`,
+                          background: manualMode === 'english' ? 'rgba(139,92,246,0.10)' : 'transparent',
+                          color: 'var(--text-primary)', cursor: 'pointer', fontSize: 12,
+                        }}
+                      >
+                        Paste English script (zero API calls)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setManualMode('hindi')}
+                        style={{
+                          flex: 1, padding: '8px 12px', borderRadius: 8,
+                          border: `1px solid ${manualMode === 'hindi' ? 'var(--accent-purple)' : 'var(--glass-border)'}`,
+                          background: manualMode === 'hindi' ? 'rgba(139,92,246,0.10)' : 'transparent',
+                          color: 'var(--text-primary)', cursor: 'pointer', fontSize: 12,
+                        }}
+                      >
+                        Paste Hindi transcript (uses DeepSeek to translate)
+                      </button>
+                    </div>
+                    {manualMode === 'english' && (
+                      <div style={styles.row}>
+                        <div style={styles.field}>
+                          <label>Source window start (sec)</label>
+                          <input type="number" min="0" value={windowStart} onChange={e => setWindowStart(e.target.value)} />
+                        </div>
+                        <div style={styles.field}>
+                          <label>Source window end (sec)</label>
+                          <input type="number" min="1" value={windowEnd} onChange={e => setWindowEnd(e.target.value)} />
+                        </div>
+                      </div>
+                    )}
                     <textarea
                       rows={8}
-                      placeholder="Paste transcript here (JSON or plain text)…"
+                      placeholder={manualMode === 'english'
+                        ? 'Paste English script JSON: { "title":..., "hook":..., "segments":[{"text":..., "mood":...}] }  — or plain English text'
+                        : 'Paste Hindi transcript JSON, or plain Hindi text…'}
                       value={transcriptText}
                       onChange={e => setTranscriptText(e.target.value)}
                       style={{ width: '100%', fontFamily: 'monospace', fontSize: 12 }}
                     />
                     <div style={styles.row}>
-                      <button className="btn-primary" onClick={submitManualTranscript} disabled={busy || !transcriptText.trim()}>
-                        Submit transcript
+                      <button className="btn-primary" onClick={submitManual} disabled={busy || !transcriptText.trim()}>
+                        Submit
                       </button>
                     </div>
                   </>
@@ -189,8 +254,12 @@ export default function TranslatePage() {
       </div>
 
       <div style={styles.card}>
-        <div style={styles.step}>3 · Translate to English (DeepSeek)</div>
-        <div style={styles.progress}>{scriptDone ? '✓ Translation written to script.json' : 'Translating segments…'}</div>
+        <div style={styles.step}>
+          3 · {isManual && manualMode === 'english' ? 'English script (no API)' : 'Translate to English (DeepSeek)'}
+        </div>
+        <div style={styles.progress}>
+          {scriptDone ? '✓ Script written' : (manualPending ? 'Waiting for transcript / script paste above…' : 'Translating segments…')}
+        </div>
       </div>
 
       <div style={styles.card}>
