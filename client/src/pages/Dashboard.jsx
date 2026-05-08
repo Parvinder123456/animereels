@@ -236,6 +236,7 @@ export default function Dashboard() {
   const [newType, setNewType] = useState('manga');
   const [newUrl, setNewUrl] = useState('');
   const [newTopic, setNewTopic] = useState('');
+  const [newManual, setNewManual] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState(null);
 
@@ -266,6 +267,7 @@ export default function Dashboard() {
           name: newName.trim() || undefined,
           url: newUrl.trim(),
           topic: newTopic.trim() || undefined,
+          mode: newManual ? 'manual' : 'auto',
         });
         setShowModal(false);
         resetModal();
@@ -299,6 +301,7 @@ export default function Dashboard() {
     setNewUrl('');
     setNewTopic('');
     setNewType('manga');
+    setNewManual(false);
   }
 
   async function handleDelete(project) {
@@ -453,6 +456,10 @@ export default function Dashboard() {
                     onChange={e => setNewName(e.target.value)}
                   />
                 </div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                  <input type="checkbox" checked={newManual} onChange={e => setNewManual(e.target.checked)} />
+                  I'll paste the transcript myself (free — use Gemini mobile or any other source)
+                </label>
               </>
             )}
 

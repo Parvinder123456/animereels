@@ -34,6 +34,19 @@ const VOICES = [
   { id: 'en-US-ChristopherNeural', label: 'Christopher — Authoritative' },
 ];
 
+const GEMINI_PROMPT = `Transcribe the attached audio. Return ONLY valid JSON in this shape, no prose, no code fence:
+
+{
+  "language": "hi",
+  "duration": <total seconds, number>,
+  "segments": [
+    { "id": 0, "start": <sec>, "end": <sec>, "text": "<verbatim transcript>" },
+    { "id": 1, "start": <sec>, "end": <sec>, "text": "..." }
+  ]
+}
+
+Rules: break at natural pauses (5-15s per segment), cover the whole audio, transcribe verbatim in the original language, do not translate.`;
+
 export default function TranslatePage() {
   const { id } = useParams();
   const progress = useSSE(id);
@@ -42,6 +55,7 @@ export default function TranslatePage() {
   const [busy, setBusy] = useState(false);
   const [voiceId, setVoiceId] = useState(VOICES[0].id);
   const [engine, setEngine] = useState('edge');
+  const [transcriptText, setTranscriptText] = useState('');
 
   useEffect(() => {
     reload();
@@ -52,6 +66,20 @@ export default function TranslatePage() {
   async function reload() {
     try { setProject(await get(`/projects/${id}`)); }
     catch (e) { setError(e.message); }
+  }
+
+  async function submitManualTranscript() {
+    if (!transcriptText.trim()) return setError('Paste a transcript first');
+    setError(null); setBusy(true);
+    try {
+      await post(`/translate/${id}/manual-transcript`, { transcript: transcriptText, format: 'auto' });
+      await reload();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  }
+
+  function copyPrompt() {
+    navigator.clipboard?.writeText(GEMINI_PROMPT).catch(() => {});
   }
 
   async function generateVoice() {
@@ -73,12 +101,15 @@ export default function TranslatePage() {
   }
 
   const state = project?.state || {};
+  const isManual       = project?.config?.transcribeMode === 'manual';
   const downloadDone   = state.upload === 'complete';
+  const audioReady     = downloadDone && (isManual ? state.panels !== 'pending' : true);
   const transcriptDone = state.panels === 'complete';
   const scriptDone     = state.script === 'complete';
   const voiceDone      = state.voice === 'complete';
   const renderDone     = state.render === 'complete';
   const errored        = (project?.errors || []).slice(-1)[0];
+  const manualPending  = isManual && audioReady && !scriptDone;
 
   return (
     <div style={styles.page} className="fade-in">
@@ -101,8 +132,60 @@ export default function TranslatePage() {
       </div>
 
       <div style={styles.card}>
-        <div style={styles.step}>2 · Whisper transcribe + topic match</div>
-        <div style={styles.progress}>{transcriptDone ? '✓ Transcript + window selected' : 'Transcribing audio with Whisper…'}</div>
+        <div style={styles.step}>2 · {isManual ? 'Paste transcript (free path)' : 'Transcribe + topic match'}</div>
+        {!isManual && (
+          <div style={styles.progress}>
+            {transcriptDone ? '✓ Transcript + window selected' : 'Transcribing audio…'}
+          </div>
+        )}
+        {isManual && (
+          <>
+            <div style={styles.progress}>
+              {audioReady
+                ? '✓ Audio extracted. Download it, run it through Gemini mobile (or any source), paste the transcript below.'
+                : 'Downloading + extracting audio…'}
+            </div>
+            {audioReady && (
+              <>
+                <div style={styles.row}>
+                  <a className="btn-secondary" href={`/data/${id}/audio/source-audio.mp3`} download>
+                    Download source-audio.mp3
+                  </a>
+                  <button type="button" className="btn-secondary" onClick={copyPrompt}>
+                    Copy Gemini prompt
+                  </button>
+                </div>
+                <details style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                  <summary style={{ cursor: 'pointer' }}>How to use Gemini mobile</summary>
+                  <ol style={{ paddingLeft: 18, lineHeight: 1.6 }}>
+                    <li>Download the audio file above onto your phone.</li>
+                    <li>Open the Gemini mobile app, attach the audio.</li>
+                    <li>Paste the prompt (button above) and send.</li>
+                    <li>Copy Gemini's full reply (JSON) and paste it below.</li>
+                    <li>Plain text also works — we'll auto-distribute timestamps.</li>
+                  </ol>
+                </details>
+                {!scriptDone && (
+                  <>
+                    <textarea
+                      rows={8}
+                      placeholder="Paste transcript here (JSON or plain text)…"
+                      value={transcriptText}
+                      onChange={e => setTranscriptText(e.target.value)}
+                      style={{ width: '100%', fontFamily: 'monospace', fontSize: 12 }}
+                    />
+                    <div style={styles.row}>
+                      <button className="btn-primary" onClick={submitManualTranscript} disabled={busy || !transcriptText.trim()}>
+                        Submit transcript
+                      </button>
+                    </div>
+                  </>
+                )}
+                {scriptDone && <div style={styles.progress}>✓ Transcript accepted, translation written</div>}
+              </>
+            )}
+          </>
+        )}
       </div>
 
       <div style={styles.card}>
