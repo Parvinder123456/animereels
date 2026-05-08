@@ -33,6 +33,13 @@ function buildResponse(s) {
       hasApiKey:    !!process.env.DEEPSEEK_API_KEY,
       textActive:   s.textBackend === 'deepseek',
     },
+    transcription: {
+      backend:          s.transcriptionBackend,
+      groqWhisperModel: s.groqWhisperModel,
+      hasOpenaiKey:     !!process.env.OPENAI_API_KEY,
+      hasGroqKey:       !!process.env.GROQ_API_KEY,
+      hasGeminiKey:     !!process.env.GEMINI_API_KEY,
+    },
   };
 }
 
@@ -46,12 +53,14 @@ router.get('/', async (_req, res, next) => {
 // POST /api/settings
 router.post('/', async (req, res, next) => {
   try {
-    const { visionBackend, textBackend, ollamaModel, ollamaTextModel, geminiModel, groqVisionModel, groqTextModel, deepseekTextModel, deepseekBaseUrl } = req.body;
+    const { visionBackend, textBackend, ollamaModel, ollamaTextModel, geminiModel, groqVisionModel, groqTextModel, deepseekTextModel, deepseekBaseUrl, transcriptionBackend, groqWhisperModel } = req.body;
     const updates = {};
     const validVisionBackends = ['ollama', 'groq', 'gemini'];
     const validTextBackends   = ['ollama', 'groq', 'gemini', 'deepseek'];
-    if (validVisionBackends.includes(visionBackend)) updates.visionBackend = visionBackend;
-    if (validTextBackends.includes(textBackend))     updates.textBackend   = textBackend;
+    const validTranscription  = ['gemini', 'groq', 'openai'];
+    if (validVisionBackends.includes(visionBackend))       updates.visionBackend        = visionBackend;
+    if (validTextBackends.includes(textBackend))           updates.textBackend          = textBackend;
+    if (validTranscription.includes(transcriptionBackend)) updates.transcriptionBackend = transcriptionBackend;
     if (ollamaModel)       updates.ollamaModel       = ollamaModel;
     if (ollamaTextModel)   updates.ollamaTextModel   = ollamaTextModel;
     if (geminiModel)       updates.geminiModel       = geminiModel;
@@ -59,6 +68,7 @@ router.post('/', async (req, res, next) => {
     if (groqTextModel)     updates.groqTextModel     = groqTextModel;
     if (deepseekTextModel) updates.deepseekTextModel = deepseekTextModel;
     if (deepseekBaseUrl)   updates.deepseekBaseUrl   = deepseekBaseUrl;
+    if (groqWhisperModel)  updates.groqWhisperModel  = groqWhisperModel;
     res.json(buildResponse(await saveSettings(updates)));
   } catch (err) { next(err); }
 });

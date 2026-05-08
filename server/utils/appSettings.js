@@ -23,6 +23,8 @@ const DEFAULTS = {
   groqTextModel:   process.env.GROQ_TEXT_MODEL   || 'llama-3.3-70b-versatile',
   deepseekTextModel: process.env.DEEPSEEK_TEXT_MODEL || 'deepseek-v4-flash',
   deepseekBaseUrl:   process.env.DEEPSEEK_BASE_URL   || 'https://api.deepseek.com',
+  transcriptionBackend: process.env.TRANSCRIPTION_BACKEND || 'gemini',
+  groqWhisperModel:     process.env.GROQ_WHISPER_MODEL    || 'whisper-large-v3-turbo',
 };
 
 let _cache = null;
