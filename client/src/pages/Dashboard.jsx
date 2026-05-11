@@ -6,7 +6,8 @@ const PROJECT_TYPES = [
   { value: 'manga',         label: 'Manga / Manhwa',     subtitle: 'Upload chapter images.',                       icon: '\u{1F4D6}' },
   { value: 'video_summary', label: 'Video Summary',      subtitle: 'Upload an anime episode → narrated recap.',    icon: '\u{1F3AC}' },
   { value: 'translate',     label: 'YouTube Hindi → EN', subtitle: 'Paste a Hindi YouTube URL → English clip.',    icon: '\u{1F310}' },
-  { value: 'shorts',        label: 'YouTube Shorts',     subtitle: 'AI picks the best moments → vertical clips.',  icon: '\u{2702}\u{FE0F}' },
+  { value: 'shorts',          label: 'YouTube Shorts',     subtitle: 'AI picks the best moments → vertical clips.',          icon: '\u{2702}\u{FE0F}' },
+  { value: 'video_explainer', label: 'Anime Explainer',    subtitle: 'Stitch multiple episodes → long narrated explainer.',  icon: '\u{1F4FA}' },
 ];
 
 const styles = {
@@ -299,6 +300,14 @@ export default function Dashboard() {
         return;
       }
 
+      if (newType === 'video_explainer') {
+        await patch(`/projects/${project.id}/config`, { projectType: 'video_explainer' });
+        setShowModal(false);
+        resetModal();
+        navigate(`/projects/${project.id}/explainer`);
+        return;
+      }
+
       setShowModal(false);
       resetModal();
       navigate(`/projects/${project.id}`);
@@ -339,6 +348,8 @@ export default function Dashboard() {
       navigate(`/projects/${project.id}/translate`);
     } else if (type === 'shorts') {
       navigate(`/projects/${project.id}/shorts`);
+    } else if (type === 'video_explainer') {
+      navigate(`/projects/${project.id}/explainer`);
     } else {
       navigate(`/projects/${project.id}`);
     }

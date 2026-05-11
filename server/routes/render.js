@@ -7,6 +7,7 @@ import { runJob, emit, isRunning } from '../jobs/processor.js';
 import { renderVideo } from '../services/videoRenderer.js';
 import { renderVideoSummary } from '../services/videoSummaryRenderer.js';
 import { renderTranslatedClip } from '../services/translatedRenderer.js';
+import { renderVideoExplainer } from '../services/videoExplainerRenderer.js';
 import { logger } from '../utils/logger.js';
 
 const router = Router();
@@ -62,6 +63,8 @@ router.post('/:id/render', validateProject, async (req, res, next) => {
           await renderVideoSummary(req.params.id, onProgress);
         } else if (projectType === 'translate') {
           await renderTranslatedClip(req.params.id, onProgress);
+        } else if (projectType === 'video_explainer') {
+          await renderVideoExplainer(req.params.id, onProgress);
         } else {
           await renderVideo(req.params.id, onProgress, renderConfig);
         }

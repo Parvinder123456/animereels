@@ -108,7 +108,7 @@ router.patch('/:id/config', async (req, res, next) => {
     if (format !== undefined && ['manga', 'webtoon'].includes(format)) {
       proj.config.format = format;
     }
-    if (projectType !== undefined && ['manga', 'webtoon', 'video_summary', 'translate'].includes(projectType)) {
+    if (projectType !== undefined && ['manga', 'webtoon', 'video_summary', 'translate', 'shorts', 'video_explainer'].includes(projectType)) {
       proj.config.projectType = projectType;
     }
     proj.updatedAt = new Date().toISOString();

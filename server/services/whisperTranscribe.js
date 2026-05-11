@@ -292,7 +292,24 @@ async function openaiTranscribe(audioPath, { language, prompt }) {
   };
 }
 
-// ─── Public entry point ──────────────────────────────────────────────────────
+// ─── Public entry points ─────────────────────────────────────────────────────
+
+/**
+ * Transcribe a pre-extracted audio file. No project I/O — pure in/out.
+ * Used by chunkedTranscribe.js so multi-chunk runs don't pollute the
+ * project tree with intermediate transcript files.
+ *
+ * @param {string} audioPath  path to an mp3 (or wav, m4a — anything ffmpeg-compatible the backend accepts)
+ * @param {{language?:string, prompt?:string, backend?:'gemini'|'groq'|'openai'}} opts
+ */
+export async function transcribeRawAudio(audioPath, opts = {}) {
+  const settings = await getSettings();
+  const backend = opts.backend || settings.transcriptionBackend || 'gemini';
+  if (backend === 'gemini') return geminiTranscribe(audioPath, opts);
+  if (backend === 'groq')   return groqTranscribe(audioPath, opts);
+  if (backend === 'openai') return openaiTranscribe(audioPath, opts);
+  throw new Error(`Unknown transcriptionBackend: ${backend}`);
+}
 
 /**
  * @param {string} projectId

@@ -16,6 +16,7 @@ import scriptRouter from './routes/script.js';
 import voiceRouter from './routes/voice.js';
 import renderRouter from './routes/render.js';
 import videoSummaryRouter from './routes/videoSummary.js';
+import videoExplainerRouter from './routes/videoExplainer.js';
 import translateRouter from './routes/translate.js';
 import shortsRouter from './routes/shorts.js';
 import eventsRouter from './routes/events.js';
@@ -50,6 +51,7 @@ app.use('/api/projects', scriptRouter);
 app.use('/api/projects', voiceRouter);
 app.use('/api/projects', renderRouter);
 app.use('/api/projects', videoSummaryRouter);
+app.use('/api/projects', videoExplainerRouter);
 
 app.use('/api/youtube', youtubeRouter);
 app.use('/api/translate', translateRouter);
