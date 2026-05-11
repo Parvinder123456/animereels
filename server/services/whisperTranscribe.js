@@ -1,19 +1,14 @@
 /**
- * Audio transcription router. Backends:
+ * Audio transcription via Gemini Flash native audio understanding.
  *
- *   gemini  (default, cheapest) — Gemini Flash native audio understanding
- *                                 via the existing GEMINI_API_KEY. Free tier
- *                                 eligible. Returns segment-level timestamps.
- *   groq                        — Groq-hosted Whisper-large-v3-turbo
- *                                 (~$0.04/hr). Returns word + segment timestamps.
- *   openai                      — OpenAI's whisper-1 (~$0.36/hr). Reference
- *                                 implementation, kept for fallback.
+ * The file name is legacy ("whisper") — there is no actual Whisper involved.
+ * The single backend is Gemini, called either with inline audio (≤19 MB)
+ * or via the Files API for longer audio (≤2 GB per upload, but downstream
+ * chunkedTranscribe.js splits into 18-min chunks well below that).
  *
- * Selected via `transcriptionBackend` in settings.json (overridable per call).
- *
- * For the translate feature we only need segment-level timestamps — words
- * are unused downstream (the burned-in subs come from the English TTS's
- * own word boundaries, not the source-language transcript).
+ * Why Gemini-only: free tier eligible, single API key with the rest of the
+ * pipeline, no extra vendor. Whisper backends were removed to keep one
+ * canonical audio path.
  */
 
 import fs from 'fs';
@@ -25,10 +20,8 @@ import { getFfmpegPath } from './gpuDetect.js';
 import { getSettings } from '../utils/appSettings.js';
 import { logger } from '../utils/logger.js';
 
-const OPENAI_BASE = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
-const OPENAI_MODEL = process.env.OPENAI_WHISPER_MODEL || 'whisper-1';
-const GROQ_BASE = 'https://api.groq.com/openai/v1';
 const GEMINI_FILES_BASE = 'https://generativelanguage.googleapis.com';
+const INLINE_LIMIT_MB = 19; // Gemini inline-data cap is ~20 MB; Files API above this
 
 // ─── Audio extraction (shared) ───────────────────────────────────────────────
 
@@ -48,7 +41,7 @@ function extractAudio(srcPath, outPath) {
   });
 }
 
-// ─── Gemini Flash (native audio) ─────────────────────────────────────────────
+// ─── Gemini transcription prompt ─────────────────────────────────────────────
 
 const GEMINI_TRANSCRIBE_PROMPT = `
 You are a transcription engine. Transcribe the attached audio. Return a single
@@ -79,20 +72,13 @@ function extractJsonObject(text) {
   return JSON.parse(raw);
 }
 
-const INLINE_LIMIT_MB = 19; // Gemini inline-data cap is ~20 MB; use Files API above this
-
 // ─── Gemini Files API (REST) ─────────────────────────────────────────────────
 
-/**
- * Upload a file via the Gemini Files API (direct REST) and poll until ACTIVE.
- * Returns { name, uri, mimeType } for use in generateContent fileData parts.
- */
 async function uploadToFilesAPI(apiKey, filePath, mimeType) {
   const displayName = path.basename(filePath);
   const fileBytes = fs.readFileSync(filePath);
   const numBytes = fileBytes.length;
 
-  // Step 1: Start resumable upload to get the upload URI
   logger.info(`[whisperTranscribe] Uploading ${displayName} (${(numBytes / 1048576).toFixed(1)} MB) via Files API...`);
   const startRes = await fetch(
     `${GEMINI_FILES_BASE}/upload/v1beta/files?key=${apiKey}`,
@@ -115,7 +101,6 @@ async function uploadToFilesAPI(apiKey, filePath, mimeType) {
   const uploadUrl = startRes.headers.get('x-goog-upload-url');
   if (!uploadUrl) throw new Error('Files API did not return an upload URL');
 
-  // Step 2: Upload the file bytes
   const uploadRes = await fetch(uploadUrl, {
     method: 'POST',
     headers: {
@@ -131,13 +116,10 @@ async function uploadToFilesAPI(apiKey, filePath, mimeType) {
   }
   let fileInfo = (await uploadRes.json()).file;
 
-  // Step 3: Poll until processing is complete
   while (fileInfo.state === 'PROCESSING') {
     logger.info(`[whisperTranscribe] Files API: state=PROCESSING, waiting...`);
     await new Promise(r => setTimeout(r, 3000));
-    const pollRes = await fetch(
-      `${GEMINI_FILES_BASE}/v1beta/${fileInfo.name}?key=${apiKey}`
-    );
+    const pollRes = await fetch(`${GEMINI_FILES_BASE}/v1beta/${fileInfo.name}?key=${apiKey}`);
     if (!pollRes.ok) throw new Error(`Files API poll failed: ${pollRes.status}`);
     fileInfo = await pollRes.json();
   }
@@ -146,17 +128,16 @@ async function uploadToFilesAPI(apiKey, filePath, mimeType) {
   }
 
   logger.info(`[whisperTranscribe] Files API upload ready: ${fileInfo.uri}`);
-  return fileInfo; // { name, uri, mimeType, ... }
+  return fileInfo;
 }
 
-/** Delete a file from Gemini Files API storage */
 async function deleteFromFilesAPI(apiKey, fileName) {
   await fetch(`${GEMINI_FILES_BASE}/v1beta/${fileName}?key=${apiKey}`, { method: 'DELETE' });
 }
 
-async function geminiTranscribe(audioPath, { language, prompt }) {
+async function geminiTranscribe(audioPath, { language, prompt } = {}) {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('GEMINI_API_KEY not set in .env (transcriptionBackend=gemini)');
+  if (!apiKey) throw new Error('GEMINI_API_KEY not set in .env');
 
   const buf = fs.readFileSync(audioPath);
   const sizeMB = buf.length / (1024 * 1024);
@@ -203,10 +184,9 @@ async function geminiTranscribe(audioPath, { language, prompt }) {
         end: Number(s.end) || 0,
         text: String(s.text || '').trim(),
       })),
-      words: [], // Gemini doesn't return word-level timestamps; not needed downstream
+      words: [],
     };
   } finally {
-    // Clean up the uploaded file from Gemini's storage
     if (uploadedFileName) {
       try {
         await deleteFromFilesAPI(apiKey, uploadedFileName);
@@ -218,108 +198,21 @@ async function geminiTranscribe(audioPath, { language, prompt }) {
   }
 }
 
-// ─── Groq Whisper (whisper-large-v3-turbo) ───────────────────────────────────
-
-async function groqTranscribe(audioPath, { language, prompt }) {
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) throw new Error('GROQ_API_KEY not set in .env (transcriptionBackend=groq)');
-
-  const settings = await getSettings();
-  const model = settings.groqWhisperModel || 'whisper-large-v3-turbo';
-
-  const form = new FormData();
-  form.append('file', new Blob([fs.readFileSync(audioPath)]), 'audio.mp3');
-  form.append('model', model);
-  form.append('response_format', 'verbose_json');
-  form.append('timestamp_granularities[]', 'segment');
-  form.append('timestamp_granularities[]', 'word');
-  if (language) form.append('language', language);
-  if (prompt)   form.append('prompt', prompt);
-
-  const res = await fetch(`${GROQ_BASE}/audio/transcriptions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body: form,
-  });
-  if (!res.ok) throw new Error(`Groq Whisper ${res.status}: ${(await res.text()).slice(0, 500)}`);
-
-  const data = await res.json();
-  return {
-    language: data.language || language || null,
-    duration: data.duration,
-    text: data.text || '',
-    segments: (data.segments || []).map(s => ({
-      id: s.id, start: s.start, end: s.end, text: s.text.trim(),
-    })),
-    words: (data.words || []).map(w => ({ word: w.word, start: w.start, end: w.end })),
-  };
-}
-
-// ─── OpenAI Whisper (whisper-1) ──────────────────────────────────────────────
-
-async function openaiTranscribe(audioPath, { language, prompt }) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error('OPENAI_API_KEY not set in .env (transcriptionBackend=openai)');
-
-  const sizeMB = fs.statSync(audioPath).size / (1024 * 1024);
-  if (sizeMB > 24.5) throw new Error(`Audio ${sizeMB.toFixed(1)} MB exceeds OpenAI Whisper 25 MB cap`);
-
-  const form = new FormData();
-  form.append('file', new Blob([fs.readFileSync(audioPath)]), 'audio.mp3');
-  form.append('model', OPENAI_MODEL);
-  form.append('response_format', 'verbose_json');
-  form.append('timestamp_granularities[]', 'word');
-  form.append('timestamp_granularities[]', 'segment');
-  if (language) form.append('language', language);
-  if (prompt)   form.append('prompt', prompt);
-
-  const res = await fetch(`${OPENAI_BASE}/audio/transcriptions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body: form,
-  });
-  if (!res.ok) throw new Error(`OpenAI Whisper ${res.status}: ${(await res.text()).slice(0, 500)}`);
-
-  const data = await res.json();
-  return {
-    language: data.language || language || null,
-    duration: data.duration,
-    text: data.text || '',
-    segments: (data.segments || []).map(s => ({
-      id: s.id, start: s.start, end: s.end, text: s.text.trim(),
-    })),
-    words: (data.words || []).map(w => ({ word: w.word, start: w.start, end: w.end })),
-  };
-}
-
 // ─── Public entry points ─────────────────────────────────────────────────────
 
 /**
- * Transcribe a pre-extracted audio file. No project I/O — pure in/out.
- * Used by chunkedTranscribe.js so multi-chunk runs don't pollute the
- * project tree with intermediate transcript files.
- *
- * @param {string} audioPath  path to an mp3 (or wav, m4a — anything ffmpeg-compatible the backend accepts)
- * @param {{language?:string, prompt?:string, backend?:'gemini'|'groq'|'openai'}} opts
+ * Transcribe a pre-extracted audio file via Gemini. Pure in/out — no
+ * project file writes. Used by chunkedTranscribe.js.
  */
 export async function transcribeRawAudio(audioPath, opts = {}) {
-  const settings = await getSettings();
-  const backend = opts.backend || settings.transcriptionBackend || 'gemini';
-  if (backend === 'gemini') return geminiTranscribe(audioPath, opts);
-  if (backend === 'groq')   return groqTranscribe(audioPath, opts);
-  if (backend === 'openai') return openaiTranscribe(audioPath, opts);
-  throw new Error(`Unknown transcriptionBackend: ${backend}`);
+  return geminiTranscribe(audioPath, opts);
 }
 
 /**
- * @param {string} projectId
- * @param {string} videoPath
- * @param {{language?:string, prompt?:string, backend?:'gemini'|'groq'|'openai'}} opts
+ * Single-shot: extract audio from a video and transcribe it. Writes the
+ * result to data/projects/<id>/audio/source-transcript.json.
  */
 export async function transcribeForTranslation(projectId, videoPath, opts = {}, onProgress = () => {}) {
-  const settings = await getSettings();
-  const backend = opts.backend || settings.transcriptionBackend || 'gemini';
-
   const audioDir = projectPath(projectId, 'audio');
   await ensureDir(audioDir);
   const audioPath = path.join(audioDir, 'source-audio.mp3');
@@ -328,23 +221,18 @@ export async function transcribeForTranslation(projectId, videoPath, opts = {}, 
   await extractAudio(videoPath, audioPath);
   const sizeMB = fs.statSync(audioPath).size / (1024 * 1024);
 
-  onProgress(`Transcribing ${sizeMB.toFixed(1)} MB via ${backend} (${opts.language || 'auto'})...`, 30);
-
-  let result;
-  if (backend === 'gemini')      result = await geminiTranscribe(audioPath, opts);
-  else if (backend === 'groq')   result = await groqTranscribe(audioPath, opts);
-  else if (backend === 'openai') result = await openaiTranscribe(audioPath, opts);
-  else throw new Error(`Unknown transcriptionBackend: ${backend}`);
+  onProgress(`Transcribing ${sizeMB.toFixed(1)} MB via Gemini (${opts.language || 'auto'})...`, 30);
+  const result = await geminiTranscribe(audioPath, opts);
 
   await fs.promises.writeFile(
     path.join(audioDir, 'source-transcript.json'),
-    JSON.stringify({ backend, ...result }, null, 2),
+    JSON.stringify({ backend: 'gemini', ...result }, null, 2),
   );
 
   onProgress('Transcription complete', 100);
   logger.info(
-    `[whisperTranscribe] backend=${backend} · ${result.language} · ` +
-    `${result.segments.length} segments · ${result.duration?.toFixed?.(1) || '?'}s`
+    `[whisperTranscribe] ${result.language} · ${result.segments.length} segments · ` +
+    `${result.duration?.toFixed?.(1) || '?'}s`
   );
   return result;
 }
