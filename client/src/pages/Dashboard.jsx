@@ -6,6 +6,7 @@ const PROJECT_TYPES = [
   { value: 'manga',         label: 'Manga / Manhwa',     subtitle: 'Upload chapter images.',                       icon: '\u{1F4D6}' },
   { value: 'video_summary', label: 'Video Summary',      subtitle: 'Upload an anime episode → narrated recap.',    icon: '\u{1F3AC}' },
   { value: 'translate',     label: 'YouTube Hindi → EN', subtitle: 'Paste a Hindi YouTube URL → English clip.',    icon: '\u{1F310}' },
+  { value: 'shorts',        label: 'YouTube Shorts',     subtitle: 'AI picks the best moments → vertical clips.',  icon: '\u{2702}\u{FE0F}' },
 ];
 
 const styles = {
@@ -261,6 +262,18 @@ export default function Dashboard() {
     setCreating(true);
     setCreateError(null);
     try {
+      if (newType === 'shorts') {
+        if (!newUrl.trim()) throw new Error('YouTube URL is required');
+        const { id } = await post('/shorts', {
+          name: newName.trim() || undefined,
+          url: newUrl.trim(),
+        });
+        setShowModal(false);
+        resetModal();
+        navigate(`/projects/${id}/shorts`);
+        return;
+      }
+
       if (newType === 'translate') {
         if (!newUrl.trim()) throw new Error('YouTube URL is required');
         const { id } = await post('/translate', {
@@ -316,7 +329,7 @@ export default function Dashboard() {
 
   function handleCardClick(project) {
     const type = project.config?.projectType;
-    if (project.state?.render === 'complete') {
+    if (project.state?.render === 'complete' && type !== 'shorts' && type !== 'translate') {
       navigate(`/projects/${project.id}/detail`);
       return;
     }
@@ -324,6 +337,8 @@ export default function Dashboard() {
       navigate(`/projects/${project.id}/video`);
     } else if (type === 'translate') {
       navigate(`/projects/${project.id}/translate`);
+    } else if (type === 'shorts') {
+      navigate(`/projects/${project.id}/shorts`);
     } else {
       navigate(`/projects/${project.id}`);
     }
@@ -412,7 +427,7 @@ export default function Dashboard() {
               </div>
             </div>
 
-            {newType !== 'translate' && (
+            {newType !== 'translate' && newType !== 'shorts' && (
               <div>
                 <label>Project Name</label>
                 <input
@@ -424,6 +439,30 @@ export default function Dashboard() {
                   autoFocus
                 />
               </div>
+            )}
+
+            {newType === 'shorts' && (
+              <>
+                <div>
+                  <label>YouTube URL</label>
+                  <input
+                    type="url"
+                    placeholder="https://www.youtube.com/watch?v=..."
+                    value={newUrl}
+                    onChange={e => setNewUrl(e.target.value)}
+                    autoFocus
+                  />
+                </div>
+                <div>
+                  <label>Project Name (optional)</label>
+                  <input
+                    type="text"
+                    placeholder="defaults to the video title"
+                    value={newName}
+                    onChange={e => setNewName(e.target.value)}
+                  />
+                </div>
+              </>
             )}
 
             {newType === 'translate' && (
@@ -472,7 +511,7 @@ export default function Dashboard() {
               <button
                 className="btn-primary"
                 onClick={handleCreate}
-                disabled={creating || !newName.trim()}
+                disabled={creating || ((newType === 'translate' || newType === 'shorts') ? !newUrl.trim() : !newName.trim())}
               >
                 {creating ? 'Creating...' : 'Create Project'}
               </button>

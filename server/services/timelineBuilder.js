@@ -174,8 +174,8 @@ function selectPanelsForTimeline(segments, allPanelPaths) {
     const repPanels = sortedPages.map(pNum => pageMap.get(pNum)[0]);
     return segments.map((_, i) => {
       const startIdx = Math.floor((i / segments.length) * repPanels.length);
-      const endIdx   = Math.floor(((i + 1) / segments.length) * repPanels.length);
-      const slice    = repPanels.slice(startIdx, endIdx);
+      const endIdx = Math.floor(((i + 1) / segments.length) * repPanels.length);
+      const slice = repPanels.slice(startIdx, endIdx);
       return slice.length > 0 ? slice : [repPanels[Math.min(i, repPanels.length - 1)]];
     });
   }
@@ -252,14 +252,14 @@ function buildNaturalTimeline(segments, segmentPanels, words, totalDuration) {
 
     const segChars = (segment.text || '').length;
     const startFraction = totalChars > 0 ? charOffset / totalChars : 0;
-    const endFraction   = totalChars > 0 ? (charOffset + segChars) / totalChars : 1;
+    const endFraction = totalChars > 0 ? (charOffset + segChars) / totalChars : 1;
     charOffset += segChars;
 
     const segStartWordIdx = Math.min(Math.round(startFraction * words.length), words.length - 1);
-    const segEndWordIdx   = Math.min(Math.round(endFraction   * words.length), words.length);
+    const segEndWordIdx = Math.min(Math.round(endFraction * words.length), words.length);
 
     const segStart = words[segStartWordIdx]?.start ?? (startFraction * totalDuration);
-    const segEnd   = words[Math.max(segEndWordIdx - 1, segStartWordIdx)]?.end ?? (endFraction * totalDuration);
+    const segEnd = words[Math.max(segEndWordIdx - 1, segStartWordIdx)]?.end ?? (endFraction * totalDuration);
     const segDuration = segEnd - segStart;
 
     const maxByDuration = Math.max(1, Math.floor(segDuration / MIN_PANEL_DURATION));
@@ -270,14 +270,14 @@ function buildNaturalTimeline(segments, segmentPanels, words, totalDuration) {
 
     for (let p = 0; p < panelCount; p++) {
       const pStart = segStart + p * panelDuration;
-      const pEnd   = segStart + (p + 1) * panelDuration;
+      const pEnd = segStart + (p + 1) * panelDuration;
       timeline.push({
         panelPath: panels[p],
         startTime: +pStart.toFixed(3),
-        endTime:   +pEnd.toFixed(3),
-        words:     words.filter(w => w.start >= pStart && w.start < pEnd),
-        mood:      segment.mood || 'dramatic',
-        pageFile:  panelToPageFile(panels[p]),
+        endTime: +pEnd.toFixed(3),
+        words: words.filter(w => w.start >= pStart && w.start < pEnd),
+        mood: segment.mood || 'dramatic',
+        pageFile: panelToPageFile(panels[p]),
         hintPages: parsePanelHint(segment.panelHint),
       });
     }
@@ -315,7 +315,7 @@ function scaleTimeline(timeline, fromDuration, toDuration) {
   return timeline.map(entry => ({
     ...entry,
     startTime: +(entry.startTime * ratio).toFixed(3),
-    endTime:   +(entry.endTime   * ratio).toFixed(3),
+    endTime: +(entry.endTime * ratio).toFixed(3),
   }));
 }
 
@@ -359,13 +359,13 @@ export function buildTimeline(segments, panelPaths, words, targetDuration = null
     const duration = targetDuration || audioDuration || 60;
     const panelDuration = Math.max(MIN_PANEL_DURATION, duration / flat.length);
     return flat.map((p, i) => ({
-      panelPath:  p,
-      startTime:  +(i * panelDuration).toFixed(3),
-      endTime:    +((i + 1) * panelDuration).toFixed(3),
-      words:      [],
-      mood:       segments[0]?.mood || 'dramatic',
-      pageFile:   panelToPageFile(p),
-      hintPages:  [],
+      panelPath: p,
+      startTime: +(i * panelDuration).toFixed(3),
+      endTime: +((i + 1) * panelDuration).toFixed(3),
+      words: [],
+      mood: segments[0]?.mood || 'dramatic',
+      pageFile: panelToPageFile(p),
+      hintPages: [],
     }));
   }
 

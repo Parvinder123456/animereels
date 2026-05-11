@@ -11,7 +11,7 @@ import { getFfmpegPath } from './gpuDetect.js';
 import { logger } from '../utils/logger.js';
 
 const DEFAULT_THRESHOLD = 0.30;
-const MIN_SCENE_SEC    = 1.5;  // collapse very short scenes (cross-fades, flashes)
+const MIN_SCENE_SEC = 1.5;  // collapse very short scenes (cross-fades, flashes)
 
 /**
  * Run ffmpeg with showinfo to get scene-cut timestamps.
@@ -48,7 +48,7 @@ export async function detectScenes(srcPath, durationSec, { threshold = DEFAULT_T
   const windows = [];
   for (let i = 0; i < boundaries.length - 1; i++) {
     const startSec = boundaries[i];
-    const endSec   = boundaries[i + 1];
+    const endSec = boundaries[i + 1];
     if (endSec - startSec < MIN_SCENE_SEC) continue; // skip flashes / cross-fades
     windows.push({ startSec, endSec, durationSec: endSec - startSec });
   }

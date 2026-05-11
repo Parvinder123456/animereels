@@ -28,6 +28,7 @@ import { downloadYouTubeVideo } from '../services/youtubeDownloader.js';
 import { transcribeForTranslation } from '../services/whisperTranscribe.js';
 import { findTopicWindow } from '../services/segmentFinder.js';
 import { translateAndScript } from '../services/translationService.js';
+import { parseEnglishScript } from '../utils/scriptParser.js';
 import { logger } from '../utils/logger.js';
 import fs from 'fs/promises';
 import path from 'path';
@@ -88,6 +89,7 @@ router.post('/', async (req, res, next) => {
         emit(project.id, step, message, percent);
       };
 
+      let currentStep = 'upload';
       try {
         project.state.upload = 'processing';
         await safeWriteJson(projectPath(project.id, 'project.json'), project);
@@ -99,6 +101,7 @@ router.post('/', async (req, res, next) => {
         emit(project.id, 'upload', 'Download complete', 100);
 
         if (mode === 'manual') {
+          currentStep = 'panels';
           project.state.panels = 'processing';
           await safeWriteJson(projectPath(project.id, 'project.json'), project);
 
@@ -126,6 +129,7 @@ router.post('/', async (req, res, next) => {
         }
 
         // Auto mode: run Whisper.
+        currentStep = 'panels';
         project.state.panels = 'processing';
         await safeWriteJson(projectPath(project.id, 'project.json'), project);
         const transcript = await transcribeForTranslation(
@@ -134,15 +138,18 @@ router.post('/', async (req, res, next) => {
           onStep('panels'),
         );
 
+        currentStep = 'script';
         await runWindowAndTranslate(project, transcript, topic, language, onStep);
       } catch (err) {
-        project.state.script = 'error';
-        project.errors.push({ step: 'translate', message: err.message, at: new Date().toISOString() });
+        project.state[currentStep] = 'error';
+        project.errors.push({ step: currentStep, message: err.message, at: new Date().toISOString() });
         await safeWriteJson(projectPath(project.id, 'project.json'), project);
-        emit(project.id, 'script', `Error: ${err.message}`, -1);
-        logger.error(`[translate] ${project.id} failed: ${err.message}`);
+        emit(project.id, currentStep, `Error: ${err.message}`, -1);
+        logger.error(`[translate] ${project.id} step=${currentStep} failed: ${err.message}`);
       }
-    }).catch(() => {});
+    }).catch((err) => {
+      logger.error(`[translate] ${project.id} unhandled: ${err?.message || err}`);
+    });
 
     res.status(202).json({ id: project.id, message: 'Translation job started' });
   } catch (err) { next(err); }
@@ -169,6 +176,7 @@ router.post('/:id/manual-transcript', async (req, res, next) => {
 
     runJob(id, async () => {
       const onStep = (step) => (message, percent) => emit(id, step, message, percent);
+      let currentStep = 'panels';
       try {
         const segments = await parseTranscript(id, transcript, format);
         if (!segments.length) throw new Error('Transcript parsed to zero segments');
@@ -189,15 +197,18 @@ router.post('/:id/manual-transcript', async (req, res, next) => {
         await safeWriteJson(projectPath(id, 'project.json'), project);
         emit(id, 'panels', `Manual transcript accepted (${segments.length} segments)`, 100);
 
+        currentStep = 'script';
         await runWindowAndTranslate(project, fakeTranscript, useTopic, useLanguage, onStep);
       } catch (err) {
-        project.state.script = 'error';
-        project.errors.push({ step: 'translate', message: err.message, at: new Date().toISOString() });
+        project.state[currentStep] = 'error';
+        project.errors.push({ step: currentStep, message: err.message, at: new Date().toISOString() });
         await safeWriteJson(projectPath(id, 'project.json'), project);
-        emit(id, 'script', `Error: ${err.message}`, -1);
-        logger.error(`[translate/manual] ${id} failed: ${err.message}`);
+        emit(id, currentStep, `Error: ${err.message}`, -1);
+        logger.error(`[translate/manual] ${id} step=${currentStep} failed: ${err.message}`);
       }
-    }).catch(() => {});
+    }).catch((err) => {
+      logger.error(`[translate/manual] ${id} unhandled: ${err?.message || err}`);
+    });
 
     res.json({ success: true, message: 'Manual transcript accepted, translating' });
   } catch (err) { next(err); }
@@ -257,79 +268,6 @@ router.post('/:id/manual-script', async (req, res, next) => {
 });
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
-
-/**
- * Accept either:
- *   - a JSON object  { title, hook?, segments: [{text, mood?}] }
- *   - a JSON array   [{text, mood?}, ...]
- *   - plain English text — auto-segmented across the window by sentence
- *
- * Returns { title, hook, segments: [{text, mood, sourceStart, sourceEnd}] }
- * with timestamps interpolated linearly across the source window so the
- * existing renderer (which uses sourceStart/sourceEnd) Just Works.
- */
-function parseEnglishScript(input, window) {
-  const span = window.endSec - window.startSec;
-
-  let title = 'Translated Clip';
-  let hook = '';
-  let raw = [];
-
-  if (typeof input === 'string') {
-    const trimmed = input.trim();
-    const looksJson = trimmed.startsWith('{') || trimmed.startsWith('[');
-    if (looksJson) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        if (Array.isArray(parsed)) raw = parsed;
-        else { title = parsed.title || title; hook = parsed.hook || ''; raw = parsed.segments || []; }
-      } catch {
-        // fall through to plain-text path
-      }
-    }
-    if (!raw.length) {
-      const sentences = trimmed
-        .replace(/\r/g, '')
-        .split(/(?<=[\.\?!])\s+|\n{2,}/)
-        .map(s => s.trim())
-        .filter(Boolean);
-      raw = sentences.map(text => ({ text, mood: 'calm' }));
-    }
-  } else if (Array.isArray(input)) {
-    raw = input;
-  } else if (input && typeof input === 'object') {
-    title = input.title || title;
-    hook  = input.hook  || '';
-    raw   = input.segments || [];
-  }
-
-  const cleaned = raw
-    .map(s => ({
-      text: String(s.text || s.english || s.content || '').trim(),
-      mood: String(s.mood || 'calm').toLowerCase(),
-    }))
-    .filter(s => s.text);
-  if (!cleaned.length) return { title, hook, segments: [] };
-
-  const totalChars = cleaned.reduce((n, s) => n + s.text.length, 0);
-  let cursor = window.startSec;
-  const segments = cleaned.map((s, i) => {
-    const share = (s.text.length / totalChars) * span;
-    const sourceStart = cursor;
-    const sourceEnd = i === cleaned.length - 1 ? window.endSec : cursor + share;
-    cursor = sourceEnd;
-    return {
-      sourceSegmentId: i,
-      sourceStart: +sourceStart.toFixed(3),
-      sourceEnd:   +sourceEnd.toFixed(3),
-      text: s.text,
-      mood: s.mood,
-    };
-  });
-
-  return { title, hook, segments };
-}
-
 
 async function runWindowAndTranslate(project, transcript, topic, language, onStep) {
   let window = null;

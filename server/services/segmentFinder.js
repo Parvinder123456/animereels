@@ -41,7 +41,7 @@ function compactSegments(segments) {
  */
 export async function findTopicWindow(segments, topic) {
   if (!segments?.length) return { found: false, startSec: 0, endSec: 0, rationale: 'no transcript segments' };
-  if (!topic?.trim())    return null;
+  if (!topic?.trim()) return null;
 
   const promptTemplate = await getPrompt();
   const prompt = `${promptTemplate}\n\nTOPIC: ${topic.trim()}\n\nTRANSCRIPT:\n${compactSegments(segments)}`;
@@ -64,7 +64,7 @@ export async function findTopicWindow(segments, topic) {
 
   // Snap to segment boundaries + clamp to allowed window length.
   let startSec = clampToSegmentStart(segments, Number(parsed.startSec) || 0);
-  let endSec   = clampToSegmentEnd(segments,   Number(parsed.endSec)   || 0);
+  let endSec = clampToSegmentEnd(segments, Number(parsed.endSec) || 0);
   if (endSec - startSec < MIN_WINDOW_SEC) {
     endSec = Math.min(segments[segments.length - 1].end, startSec + MIN_WINDOW_SEC);
   }

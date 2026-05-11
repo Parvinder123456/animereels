@@ -48,7 +48,11 @@ export default function VideoSummaryPage() {
   const fileInputRef = useRef(null);
   const [fileName, setFileName] = useState(null);
 
-  useEffect(() => { reload(); }, [id]);
+  useEffect(() => {
+    reload();
+    const t = setInterval(reload, 4000);
+    return () => clearInterval(t);
+  }, [id]);
 
   async function reload() {
     try { setProject(await get(`/projects/${id}`)); }

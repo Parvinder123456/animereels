@@ -68,6 +68,7 @@ export default function TranslatePage() {
   const [busy, setBusy] = useState(false);
   const [voiceId, setVoiceId] = useState(VOICES[0].id);
   const [engine, setEngine] = useState('edge');
+  const [aspect, setAspect] = useState('9:16');
   const [transcriptText, setTranscriptText] = useState('');
   const [manualMode, setManualMode] = useState('english'); // 'hindi' | 'english'
   const [windowStart, setWindowStart] = useState(0);
@@ -119,7 +120,7 @@ export default function TranslatePage() {
   async function renderVideo() {
     setError(null); setBusy(true);
     try {
-      await post(`/projects/${id}/render`, {});
+      await post(`/projects/${id}/render`, { aspect });
       await reload();
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
@@ -141,7 +142,10 @@ export default function TranslatePage() {
       <div style={styles.title}>{project?.name || 'YouTube Hindi → English'}</div>
 
       {error && <div style={styles.errorBanner}>{error}</div>}
-      {errored && <div style={styles.errorBanner}>Last error: {errored.message}</div>}
+      {errored && <div style={styles.errorBanner}>Last error ({errored.step}): {errored.message}</div>}
+      {progress && progress.percent === -1 && (
+        <div style={styles.errorBanner}>{progress.message}</div>
+      )}
 
       {progress && progress.percent >= 0 && (
         <div style={styles.card}>
@@ -153,14 +157,20 @@ export default function TranslatePage() {
 
       <div style={styles.card}>
         <div style={styles.step}>1 · Download from YouTube</div>
-        <div style={styles.progress}>{downloadDone ? '✓ Source downloaded' : 'Downloading via yt-dlp…'}</div>
+        <div style={styles.progress}>
+          {state.upload === 'error' ? '✗ Download failed — check server logs'
+           : downloadDone ? '✓ Source downloaded'
+           : 'Downloading via yt-dlp…'}
+        </div>
       </div>
 
       <div style={styles.card}>
         <div style={styles.step}>2 · {isManual ? 'Paste transcript (free path)' : 'Transcribe + topic match'}</div>
         {!isManual && (
           <div style={styles.progress}>
-            {transcriptDone ? '✓ Transcript + window selected' : 'Transcribing audio…'}
+            {state.panels === 'error' ? '✗ Transcription failed — check server logs'
+             : transcriptDone ? '✓ Transcript + window selected'
+             : 'Transcribing audio…'}
           </div>
         )}
         {isManual && (
@@ -258,7 +268,9 @@ export default function TranslatePage() {
           3 · {isManual && manualMode === 'english' ? 'English script (no API)' : 'Translate to English (DeepSeek)'}
         </div>
         <div style={styles.progress}>
-          {scriptDone ? '✓ Script written' : (manualPending ? 'Waiting for transcript / script paste above…' : 'Translating segments…')}
+          {state.script === 'error' ? '✗ Translation failed — check server logs'
+           : scriptDone ? '✓ Script written'
+           : (manualPending ? 'Waiting for transcript / script paste above…' : 'Translating segments…')}
         </div>
       </div>
 
@@ -287,6 +299,15 @@ export default function TranslatePage() {
       <div style={styles.card}>
         <div style={styles.step}>5 · Render final clip</div>
         <div style={styles.row}>
+          <div style={styles.field}>
+            <label>Aspect ratio</label>
+            <select value={aspect} onChange={e => setAspect(e.target.value)}>
+              <option value="9:16">9:16 (Reels / Shorts)</option>
+              <option value="1:1">1:1 (Square)</option>
+              <option value="16:9">16:9 (Landscape)</option>
+              <option value="original">Original</option>
+            </select>
+          </div>
           <button className="btn-primary" onClick={renderVideo} disabled={busy || !voiceDone}>
             {renderDone ? 'Re-render' : 'Render'}
           </button>

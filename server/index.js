@@ -17,6 +17,7 @@ import voiceRouter from './routes/voice.js';
 import renderRouter from './routes/render.js';
 import videoSummaryRouter from './routes/videoSummary.js';
 import translateRouter from './routes/translate.js';
+import shortsRouter from './routes/shorts.js';
 import eventsRouter from './routes/events.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { logger } from './utils/logger.js';
@@ -52,6 +53,7 @@ app.use('/api/projects', videoSummaryRouter);
 
 app.use('/api/youtube', youtubeRouter);
 app.use('/api/translate', translateRouter);
+app.use('/api/shorts', shortsRouter);
 app.use('/api/series', seriesRouter);
 
 // Serve built React app in production

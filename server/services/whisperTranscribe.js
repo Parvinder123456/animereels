@@ -28,6 +28,7 @@ import { logger } from '../utils/logger.js';
 const OPENAI_BASE = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
 const OPENAI_MODEL = process.env.OPENAI_WHISPER_MODEL || 'whisper-1';
 const GROQ_BASE = 'https://api.groq.com/openai/v1';
+const GEMINI_FILES_BASE = 'https://generativelanguage.googleapis.com';
 
 // ─── Audio extraction (shared) ───────────────────────────────────────────────
 
@@ -78,18 +79,88 @@ function extractJsonObject(text) {
   return JSON.parse(raw);
 }
 
+const INLINE_LIMIT_MB = 19; // Gemini inline-data cap is ~20 MB; use Files API above this
+
+// ─── Gemini Files API (REST) ─────────────────────────────────────────────────
+
+/**
+ * Upload a file via the Gemini Files API (direct REST) and poll until ACTIVE.
+ * Returns { name, uri, mimeType } for use in generateContent fileData parts.
+ */
+async function uploadToFilesAPI(apiKey, filePath, mimeType) {
+  const displayName = path.basename(filePath);
+  const fileBytes = fs.readFileSync(filePath);
+  const numBytes = fileBytes.length;
+
+  // Step 1: Start resumable upload to get the upload URI
+  logger.info(`[whisperTranscribe] Uploading ${displayName} (${(numBytes / 1048576).toFixed(1)} MB) via Files API...`);
+  const startRes = await fetch(
+    `${GEMINI_FILES_BASE}/upload/v1beta/files?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: {
+        'X-Goog-Upload-Protocol': 'resumable',
+        'X-Goog-Upload-Command': 'start',
+        'X-Goog-Upload-Header-Content-Length': String(numBytes),
+        'X-Goog-Upload-Header-Content-Type': mimeType,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ file: { displayName } }),
+    }
+  );
+  if (!startRes.ok) {
+    const errText = await startRes.text();
+    throw new Error(`Files API start upload failed (${startRes.status}): ${errText.slice(0, 500)}`);
+  }
+  const uploadUrl = startRes.headers.get('x-goog-upload-url');
+  if (!uploadUrl) throw new Error('Files API did not return an upload URL');
+
+  // Step 2: Upload the file bytes
+  const uploadRes = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Length': String(numBytes),
+      'X-Goog-Upload-Offset': '0',
+      'X-Goog-Upload-Command': 'upload, finalize',
+    },
+    body: fileBytes,
+  });
+  if (!uploadRes.ok) {
+    const errText = await uploadRes.text();
+    throw new Error(`Files API upload failed (${uploadRes.status}): ${errText.slice(0, 500)}`);
+  }
+  let fileInfo = (await uploadRes.json()).file;
+
+  // Step 3: Poll until processing is complete
+  while (fileInfo.state === 'PROCESSING') {
+    logger.info(`[whisperTranscribe] Files API: state=PROCESSING, waiting...`);
+    await new Promise(r => setTimeout(r, 3000));
+    const pollRes = await fetch(
+      `${GEMINI_FILES_BASE}/v1beta/${fileInfo.name}?key=${apiKey}`
+    );
+    if (!pollRes.ok) throw new Error(`Files API poll failed: ${pollRes.status}`);
+    fileInfo = await pollRes.json();
+  }
+  if (fileInfo.state === 'FAILED') {
+    throw new Error(`Gemini Files API processing failed for ${displayName}`);
+  }
+
+  logger.info(`[whisperTranscribe] Files API upload ready: ${fileInfo.uri}`);
+  return fileInfo; // { name, uri, mimeType, ... }
+}
+
+/** Delete a file from Gemini Files API storage */
+async function deleteFromFilesAPI(apiKey, fileName) {
+  await fetch(`${GEMINI_FILES_BASE}/v1beta/${fileName}?key=${apiKey}`, { method: 'DELETE' });
+}
+
 async function geminiTranscribe(audioPath, { language, prompt }) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY not set in .env (transcriptionBackend=gemini)');
 
   const buf = fs.readFileSync(audioPath);
   const sizeMB = buf.length / (1024 * 1024);
-  if (sizeMB > 19) {
-    throw new Error(
-      `Audio is ${sizeMB.toFixed(1)} MB — Gemini inline-audio limit is ~20 MB. ` +
-      `Use transcriptionBackend=groq for longer audio (Phase 4 will add Files-API chunking).`
-    );
-  }
+  const useFilesAPI = sizeMB > INLINE_LIMIT_MB;
 
   const settings = await getSettings();
   const genAI = new GoogleGenerativeAI(apiKey);
@@ -101,26 +172,50 @@ async function geminiTranscribe(audioPath, { language, prompt }) {
   const langHint = language ? `\nThe primary language is "${language}".` : '';
   const ctxHint  = prompt   ? `\nContext (use to bias spelling): ${prompt}` : '';
 
-  const result = await model.generateContent([
-    GEMINI_TRANSCRIBE_PROMPT + langHint + ctxHint,
-    { inlineData: { data: buf.toString('base64'), mimeType: 'audio/mp3' } },
-  ]);
+  let audioPart;
+  let uploadedFileName = null;
 
-  const text = result.response.text();
-  const data = extractJsonObject(text);
+  if (useFilesAPI) {
+    logger.info(`[whisperTranscribe] Audio is ${sizeMB.toFixed(1)} MB (>${INLINE_LIMIT_MB} MB) — using Files API`);
+    const fileInfo = await uploadToFilesAPI(apiKey, audioPath, 'audio/mp3');
+    uploadedFileName = fileInfo.name;
+    audioPart = { fileData: { mimeType: fileInfo.mimeType, fileUri: fileInfo.uri } };
+  } else {
+    audioPart = { inlineData: { data: buf.toString('base64'), mimeType: 'audio/mp3' } };
+  }
 
-  return {
-    language: data.language || language || null,
-    duration: Number(data.duration) || 0,
-    text: (data.segments || []).map(s => s.text).join(' '),
-    segments: (data.segments || []).map((s, i) => ({
-      id: typeof s.id === 'number' ? s.id : i,
-      start: Number(s.start) || 0,
-      end: Number(s.end) || 0,
-      text: String(s.text || '').trim(),
-    })),
-    words: [], // Gemini doesn't return word-level timestamps; not needed downstream
-  };
+  try {
+    const result = await model.generateContent([
+      GEMINI_TRANSCRIBE_PROMPT + langHint + ctxHint,
+      audioPart,
+    ]);
+
+    const text = result.response.text();
+    const data = extractJsonObject(text);
+
+    return {
+      language: data.language || language || null,
+      duration: Number(data.duration) || 0,
+      text: (data.segments || []).map(s => s.text).join(' '),
+      segments: (data.segments || []).map((s, i) => ({
+        id: typeof s.id === 'number' ? s.id : i,
+        start: Number(s.start) || 0,
+        end: Number(s.end) || 0,
+        text: String(s.text || '').trim(),
+      })),
+      words: [], // Gemini doesn't return word-level timestamps; not needed downstream
+    };
+  } finally {
+    // Clean up the uploaded file from Gemini's storage
+    if (uploadedFileName) {
+      try {
+        await deleteFromFilesAPI(apiKey, uploadedFileName);
+        logger.info(`[whisperTranscribe] Cleaned up Files API upload: ${uploadedFileName}`);
+      } catch (e) {
+        logger.warn(`[whisperTranscribe] Failed to delete uploaded file: ${e.message}`);
+      }
+    }
+  }
 }
 
 // ─── Groq Whisper (whisper-large-v3-turbo) ───────────────────────────────────

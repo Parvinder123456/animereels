@@ -14,9 +14,9 @@ import { ensureDir } from '../utils/fileHelpers.js';
 import { getFfmpegPath, getCpuEncodingOptions } from './gpuDetect.js';
 import { logger } from '../utils/logger.js';
 
-const TARGET_WIDTH  = 1920;
+const TARGET_WIDTH = 1920;
 const TARGET_HEIGHT = 1080;
-const TARGET_FPS    = 25;
+const TARGET_FPS = 25;
 
 function extractOne(srcPath, clip, outPath) {
   return new Promise((resolve, reject) => {
@@ -27,8 +27,8 @@ function extractOne(srcPath, clip, outPath) {
       .outputOptions([
         ...getCpuEncodingOptions(20, 'veryfast'),
         '-vf', `scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:force_original_aspect_ratio=decrease,` +
-               `pad=${TARGET_WIDTH}:${TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,` +
-               `fps=${TARGET_FPS},setsar=1`,
+        `pad=${TARGET_WIDTH}:${TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,` +
+        `fps=${TARGET_FPS},setsar=1`,
         '-c:a', 'aac',
         '-b:a', '160k',
         '-ar', '48000',
@@ -47,7 +47,7 @@ function extractOne(srcPath, clip, outPath) {
  * @param {Array<{clipIndex, startSec, endSec, durationSec}>} clips
  * @param {string} outDir directory to write clip files into
  */
-export async function extractClips(srcPath, clips, outDir, onProgress = () => {}) {
+export async function extractClips(srcPath, clips, outDir, onProgress = () => { }) {
   await ensureDir(outDir);
   const out = [];
 

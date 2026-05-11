@@ -142,6 +142,8 @@ function getClient() {
 }
 
 export async function generateNarration(projectId, voiceId, onProgress = () => { }) {
+  voiceId = voiceId || process.env.ELEVENLABS_VOICE_ID;
+  if (!voiceId) throw new Error('No ElevenLabs voice ID — set ELEVENLABS_VOICE_ID in .env or pass voiceId');
   logger.info(`[generateNarration] START — project: ${projectId}, voiceId: ${voiceId}`);
 
   const client = getClient();
@@ -294,6 +296,8 @@ export async function generateNarration(projectId, voiceId, onProgress = () => {
 }
 
 export async function generatePreview(projectId, voiceId) {
+  voiceId = voiceId || process.env.ELEVENLABS_VOICE_ID;
+  if (!voiceId) throw new Error('No ElevenLabs voice ID — set ELEVENLABS_VOICE_ID in .env or pass voiceId');
   logger.info(`[generatePreview] START — project: ${projectId}, voiceId: ${voiceId}`);
 
   const client = getClient();

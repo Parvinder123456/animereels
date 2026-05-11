@@ -62,7 +62,7 @@ async function getAuthenticatedClient() {
  * @param {string} [opts.privacy]   - 'public' | 'private' | 'unlisted' (default: 'private')
  * @param {function} [opts.onProgress]
  */
-export async function uploadVideo({ videoPath, title, description, tags = [], thumbPath, privacy = 'private', onProgress = () => {} }) {
+export async function uploadVideo({ videoPath, title, description, tags = [], thumbPath, privacy = 'private', onProgress = () => { } }) {
   const auth = await getAuthenticatedClient();
   const youtube = google.youtube({ version: 'v3', auth });
 

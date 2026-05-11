@@ -21,7 +21,7 @@ router.post('/:id/render', validateProject, async (req, res, next) => {
     }
 
     // Extract render config from request body
-    const { duration, detail, format } = req.body;
+    const { duration, detail, format, aspect } = req.body;
     const renderConfig = {};
 
     if (duration && typeof duration === 'number' && duration > 0) {
@@ -33,6 +33,9 @@ router.post('/:id/render', validateProject, async (req, res, next) => {
     if (format && ['manga', 'webtoon'].includes(format)) {
       renderConfig.format = format;
     }
+    if (aspect && ['9:16', '16:9', '1:1', 'original'].includes(aspect)) {
+      renderConfig.aspect = aspect;
+    }
 
     const project = req.project;
 
@@ -41,6 +44,7 @@ router.post('/:id/render', validateProject, async (req, res, next) => {
     if (renderConfig.duration) project.config.duration = renderConfig.duration;
     if (renderConfig.detail) project.config.detail = renderConfig.detail;
     if (renderConfig.format) project.config.format = renderConfig.format;
+    if (renderConfig.aspect) project.config.aspect = renderConfig.aspect;
 
     runJob(req.params.id, async () => {
       try {

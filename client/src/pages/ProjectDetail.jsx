@@ -171,7 +171,13 @@ export default function ProjectDetail() {
           <div style={styles.headerActions}>
             <button
               className="btn-secondary"
-              onClick={() => navigate(`/projects/${id}`)}
+              onClick={() => {
+                const type = project?.config?.projectType;
+                if (type === 'shorts') navigate(`/projects/${id}/shorts`);
+                else if (type === 'translate') navigate(`/projects/${id}/translate`);
+                else if (type === 'video_summary') navigate(`/projects/${id}/video`);
+                else navigate(`/projects/${id}`);
+              }}
             >
               Edit / Re-render
             </button>
