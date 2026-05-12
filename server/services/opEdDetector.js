@@ -17,10 +17,35 @@ import fs from 'fs/promises';
 import path from 'path';
 import ffmpeg from 'fluent-ffmpeg';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { ensureDir, projectPath, safeWriteJson } from '../utils/fileHelpers.js';
+import { ensureDir, projectPath, safeReadJson, safeWriteJson, fileExists } from '../utils/fileHelpers.js';
 import { getFfmpegPath } from './gpuDetect.js';
 import { getSettings } from '../utils/appSettings.js';
 import { logger } from '../utils/logger.js';
+
+// ─── Source-identity cache (same scheme as geminiVideoBreakdown.js) ──────────
+
+async function sourceIdentity(sourcePath) {
+  const stat = await fs.stat(sourcePath);
+  return { size: stat.size, mtimeMs: Math.round(stat.mtimeMs) };
+}
+
+function identityMatches(a, b) {
+  return !!a && !!b && a.size === b.size && a.mtimeMs === b.mtimeMs;
+}
+
+/**
+ * Return a previously-saved OP/ED detection if it exists AND was produced
+ * from the same source file (same size + mtime). Otherwise null.
+ */
+export async function loadCachedOpEd(projectId, sourcePath) {
+  const cachedPath = projectPath(projectId, 'op-ed-cuts.json');
+  if (!await fileExists(cachedPath)) return null;
+  const cached = await safeReadJson(cachedPath);
+  if (!cached || !cached.sourceIdentity) return null;
+  const current = await sourceIdentity(sourcePath).catch(() => null);
+  if (!identityMatches(cached.sourceIdentity, current)) return null;
+  return cached;
+}
 
 const SAMPLE_SEC = 90; // length of each audio sample sent to Gemini
 const MAX_SAMPLES = 8; // safety cap — won't send more than 8 samples per call
@@ -166,6 +191,8 @@ export async function detectOpEd(projectId, sourcePath, episodes, onProgress = (
 
   await safeWriteJson(projectPath(projectId, 'op-ed-cuts.json'), {
     opVerdict, edVerdict, opCuts, edCuts,
+    sourceIdentity: await sourceIdentity(sourcePath).catch(() => null),
+    cachedAt: new Date().toISOString(),
   });
 
   // Clean up audio samples — they're temporary.

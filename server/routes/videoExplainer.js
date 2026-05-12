@@ -29,8 +29,8 @@ import {
 } from '../utils/fileHelpers.js';
 import { runJob, emit, isRunning } from '../jobs/processor.js';
 import { stitchEpisodes } from '../services/videoStitcher.js';
-import { detectOpEd, mergeSkipWindows } from '../services/opEdDetector.js';
-import { breakDownVideo } from '../services/geminiVideoBreakdown.js';
+import { detectOpEd, mergeSkipWindows, loadCachedOpEd } from '../services/opEdDetector.js';
+import { breakDownVideo, loadCachedPlan } from '../services/geminiVideoBreakdown.js';
 import { selectScenes, pickMode } from '../services/sceneSelector.js';
 import { writeExplainerScript } from '../services/explainerScriptWriter.js';
 import { logger } from '../utils/logger.js';
@@ -118,6 +118,7 @@ router.post('/:id/explainer/run', validateProject, async (req, res, next) => {
 
     const targetDurationSec = Math.max(60, Number(req.body?.targetDurationSec) || 60 * 60);
     const language = (req.body?.language || 'en').trim();
+    const force = req.body?.force === true || req.body?.force === 'true';
 
     runJob(req.params.id, async () => {
       let currentStep = 'panels';
@@ -136,20 +137,45 @@ router.post('/:id/explainer/run', validateProject, async (req, res, next) => {
 
         const totalSec = episodes.reduce((s, e) => s + e.durationSec, 0);
 
-        // 1. OP/ED detect (Gemini audio fingerprint match across episode boundaries).
-        onStep('panels')('Detecting OP/ED themes...', 2);
-        const { opCuts, edCuts } = await detectOpEd(req.params.id, sourcePath, episodes, (msg, pct) =>
-          onStep('panels')(msg, 2 + Math.round(pct * 0.08))
-        );
+        // 1. OP/ED detect. CACHED: if op-ed-cuts.json was produced from
+        // an unchanged source.mp4, skip the Gemini audio calls entirely.
+        let opCuts, edCuts;
+        if (!force) {
+          const cached = await loadCachedOpEd(req.params.id, sourcePath);
+          if (cached) {
+            opCuts = cached.opCuts || [];
+            edCuts = cached.edCuts || [];
+            onStep('panels')(`OP/ED cache hit (${opCuts.length} + ${edCuts.length} cuts) — skipping detection`, 8);
+            logger.info(`[videoExplainer] op-ed cache hit: ${opCuts.length} OP + ${edCuts.length} ED cuts`);
+          }
+        }
+        if (!opCuts) {
+          onStep('panels')('Detecting OP/ED themes...', 2);
+          ({ opCuts, edCuts } = await detectOpEd(req.params.id, sourcePath, episodes, (msg, pct) =>
+            onStep('panels')(msg, 2 + Math.round(pct * 0.08))
+          ));
+        }
         const skipWindows = mergeSkipWindows(opCuts, edCuts);
 
-        // 2. Gemini multimodal visual+audio breakdown. Each scene's boundaries
-        // are anchored to ACTUAL visual cuts and carry both visualDescription
-        // and dialogue context — the basis of the visuals/narration sync.
-        onStep('panels')('Gemini multimodal scene breakdown (visual + audio)...', 12);
-        const plan = await breakDownVideo(req.params.id, sourcePath, totalSec, skipWindows, (msg, pct) =>
-          onStep('panels')(msg, 12 + Math.round(pct * 0.70))
-        );
+        // 2. Gemini multimodal visual+audio breakdown. CACHED: scene-plan.json
+        // is keyed on the source file's identity (size + mtime). Re-runs with
+        // a different target duration reuse the breakdown, saving the bulk of
+        // the Gemini billable cost (~$0.90 per source).
+        let plan;
+        if (!force) {
+          const cached = await loadCachedPlan(req.params.id, sourcePath);
+          if (cached) {
+            plan = cached;
+            onStep('panels')(`Scene plan cache hit (${plan.scenes.length} scenes from prior breakdown) — skipping breakdown`, 80);
+            logger.info(`[videoExplainer] scene-plan cache hit: ${plan.scenes.length} scenes (cachedAt=${plan.cachedAt})`);
+          }
+        }
+        if (!plan) {
+          onStep('panels')('Gemini multimodal scene breakdown (visual + audio)...', 12);
+          plan = await breakDownVideo(req.params.id, sourcePath, totalSec, skipWindows, (msg, pct) =>
+            onStep('panels')(msg, 12 + Math.round(pct * 0.70))
+          );
+        }
         if (!plan.scenes?.length) throw new Error('Scene breakdown returned zero scenes — source unreadable?');
 
         // 3. Mode pick + scene selection to fit target duration.

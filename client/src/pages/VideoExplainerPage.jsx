@@ -49,6 +49,7 @@ export default function VideoExplainerPage() {
   const [voiceId, setVoiceId] = useState(VOICES[0].id);
   const [engine, setEngine] = useState('edge');
   const [aspect, setAspect] = useState('16:9');
+  const [forceRefresh, setForceRefresh] = useState(false);
   const fileInputRef = useRef(null);
   const [fileNames, setFileNames] = useState([]);
 
@@ -85,6 +86,7 @@ export default function VideoExplainerPage() {
       await post(`/projects/${id}/explainer/run`, {
         targetDurationSec: Math.max(60, Number(targetMinutes) * 60),
         language: 'en',
+        force: forceRefresh,
       });
       await reload();
     } catch (e) { setError(e.message); }
@@ -167,7 +169,7 @@ export default function VideoExplainerPage() {
       </div>
 
       <div style={styles.card}>
-        <div style={styles.step}>2 · Analyze → script (OP/ED auto-cut, Whisper, hierarchical summary)</div>
+        <div style={styles.step}>2 · Analyze → script (OP/ED auto-cut, Gemini multimodal scene breakdown)</div>
         <div style={styles.row}>
           <div style={styles.field}>
             <label>Target output (minutes)</label>
@@ -186,7 +188,15 @@ export default function VideoExplainerPage() {
             {analyzeDone ? 'Re-run analysis' : 'Run analysis'}
           </button>
         </div>
-        {analyzeDone && <div style={styles.progress}>✓ Script + beats ready</div>}
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-secondary)', cursor: 'pointer' }}>
+          <input type="checkbox" checked={forceRefresh} onChange={e => setForceRefresh(e.target.checked)} />
+          Force re-run from scratch (skip scene-plan + OP/ED cache — costs ~$0.90 in Gemini if free tier is exhausted)
+        </label>
+        <div style={styles.hint}>
+          By default, re-running with the same source skips the Gemini multimodal breakdown
+          (the most expensive step). Only the scene-selection + script-writer steps re-run.
+        </div>
+        {analyzeDone && <div style={styles.progress}>✓ Script + scenes ready</div>}
       </div>
 
       <div style={styles.card}>

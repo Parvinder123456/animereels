@@ -27,7 +27,7 @@ import { fileURLToPath } from 'url';
 import ffmpeg from 'fluent-ffmpeg';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import {
-  ensureDir, projectPath, safeWriteJson,
+  ensureDir, projectPath, safeReadJson, safeWriteJson, fileExists,
 } from '../utils/fileHelpers.js';
 import { getFfmpegPath } from './gpuDetect.js';
 import { getSettings } from '../utils/appSettings.js';
@@ -187,6 +187,37 @@ function clampInt(v, lo, hi, fallback) {
   return Math.max(lo, Math.min(hi, n));
 }
 
+// ─── Source-identity cache ───────────────────────────────────────────────────
+//
+// The breakdown step costs the most (Gemini Files API upload + multimodal
+// analysis × N chunks). Re-running with the same source.mp4 but a different
+// target duration shouldn't pay for the breakdown again. We tag the saved
+// scene-plan.json with the source file's mtime + size, then short-circuit on
+// re-run when both still match.
+
+async function sourceIdentity(sourcePath) {
+  const stat = await fsp.stat(sourcePath);
+  return { size: stat.size, mtimeMs: Math.round(stat.mtimeMs) };
+}
+
+function identityMatches(a, b) {
+  return !!a && !!b && a.size === b.size && a.mtimeMs === b.mtimeMs;
+}
+
+/**
+ * Return a previously-saved scene plan if it exists AND was produced from
+ * the same source file (same size + mtime). Otherwise null.
+ */
+export async function loadCachedPlan(projectId, sourcePath) {
+  const planPath = projectPath(projectId, 'scene-plan.json');
+  if (!await fileExists(planPath)) return null;
+  const plan = await safeReadJson(planPath);
+  if (!plan?.scenes?.length || !plan.sourceIdentity) return null;
+  const current = await sourceIdentity(sourcePath).catch(() => null);
+  if (!identityMatches(plan.sourceIdentity, current)) return null;
+  return plan;
+}
+
 // ─── Public entry point ──────────────────────────────────────────────────────
 
 /**
@@ -272,6 +303,8 @@ export async function breakDownVideo(projectId, sourcePath, totalSec, skipWindow
     rawSceneCount: allScenes.length,
     sceneCount: filteredScenes.length,
     scenes: filteredScenes,
+    sourceIdentity: await sourceIdentity(sourcePath).catch(() => null),
+    cachedAt: new Date().toISOString(),
   };
   await safeWriteJson(projectPath(projectId, 'scene-plan.json'), plan);
 
