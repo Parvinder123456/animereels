@@ -126,9 +126,20 @@ router.delete('/:id', async (req, res, next) => {
     const exists = await fileExists(projectPath(req.params.id, 'project.json'));
     if (!exists) return res.status(404).json({ error: 'Project not found' });
 
-    await fs.rm(dir, { recursive: true, force: true });
-    logger.info(`Deleted project: ${req.params.id}`);
-    res.json({ success: true });
+    // On Windows, files may be temporarily locked (EBUSY). Retry a few times.
+    let lastErr;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await fs.rm(dir, { recursive: true, force: true });
+        logger.info(`Deleted project: ${req.params.id}`);
+        return res.json({ success: true });
+      } catch (e) {
+        if (e.code !== 'EBUSY' && e.code !== 'EPERM') throw e;
+        lastErr = e;
+        await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+      }
+    }
+    throw lastErr;
   } catch (err) {
     next(err);
   }

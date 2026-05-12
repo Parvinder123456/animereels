@@ -22,7 +22,7 @@ import { logger } from '../utils/logger.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROMPT_PATH = path.resolve(__dirname, '..', '..', 'prompts', 'explainer-narration.v1.md');
 
-const WORDS_PER_SECOND = 2.3;
+const WORDS_PER_SECOND = 2.5;
 const BATCH_SIZE = 15;
 
 async function getPrompt() {
@@ -37,12 +37,13 @@ function extractJsonObject(text) {
   return JSON.parse(raw);
 }
 
-function formatBeats(beats) {
+function formatBeats(beats, wordBudgets) {
   return beats.map(b => {
     const dialogue = b.segments.map(s => `  [${s.start.toFixed(1)}s] ${s.text}`).join('\n');
+    const targetWords = wordBudgets?.[b.beatIndex] ?? Math.round(b.durationSec * WORDS_PER_SECOND);
     return (
       `BEAT ${b.beatIndex} (episode ${b.episodeIdx}, ${b.startSec.toFixed(1)}-${b.endSec.toFixed(1)}s, ` +
-      `${b.durationSec.toFixed(1)}s, target ~${Math.round(b.durationSec * WORDS_PER_SECOND)} words):\n${dialogue || '  (no dialogue — visual-only beat)'}`
+      `${b.durationSec.toFixed(1)}s, target ~${targetWords} words):\n${dialogue || '  (no dialogue — visual-only beat)'}`
     );
   }).join('\n\n');
 }
@@ -57,10 +58,24 @@ function chunk(arr, size) {
  * @param {string} projectId
  * @param {object} bundleSummary       from storySummarizer.summarizeBundle
  * @param {Array<object>} beats        clusters from beatClusterer
+ * @param {Function} onProgress
+ * @param {object} opts
+ * @param {number} opts.targetReelSec  target video duration — used to budget words per beat
  */
-export async function writeExplainerScript(projectId, bundleSummary, beats, onProgress = () => {}) {
+export async function writeExplainerScript(projectId, bundleSummary, beats, onProgress = () => {}, { targetReelSec } = {}) {
   if (!beats.length) throw new Error('No beats to write narration for');
   const promptTemplate = await getPrompt();
+
+  // Compute per-beat word budget proportional to target duration.
+  const totalBeatDur = beats.reduce((s, b) => s + b.durationSec, 0);
+  const effectiveTarget = targetReelSec || totalBeatDur;
+  const totalWords = Math.round(effectiveTarget * WORDS_PER_SECOND);
+  const wordBudgets = {};
+  for (const b of beats) {
+    const share = b.durationSec / (totalBeatDur || 1);
+    wordBudgets[b.beatIndex] = Math.max(10, Math.round(share * totalWords));
+  }
+  logger.info(`[explainerScriptWriter] targetReelSec=${effectiveTarget.toFixed(0)}, totalWords=${totalWords}, beats=${beats.length}`);
 
   const batches = chunk(beats, BATCH_SIZE);
   const allSegments = [];
@@ -86,7 +101,7 @@ export async function writeExplainerScript(projectId, bundleSummary, beats, onPr
     const prompt =
       `${promptTemplate}\n\n${contextBlock}\n\n` +
       (isFirst ? `Write the hook + segments for this batch.\n\n` : `This is batch ${b + 1} of ${batches.length} — DO NOT write a hook for this batch (leave hook empty).\n\n`) +
-      `BEATS:\n${formatBeats(batchBeats)}`;
+      `BEATS:\n${formatBeats(batchBeats, wordBudgets)}`;
 
     let parsed;
     try {

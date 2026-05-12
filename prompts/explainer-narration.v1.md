@@ -8,7 +8,7 @@ You will receive:
 2. A list of BEATS in chronological order. Each beat has:
    - beatIndex, episodeIdx, startSec, endSec, durationSec
    - dialogue: the verbatim lines spoken during this beat
-3. A target words-per-second pace (~2.3 for natural narration).
+3. A target words-per-second pace (~2.5 for natural narration).
 
 For each beat, write narration that:
 - Knows the BUNDLE context (don't reintroduce characters viewers have heard
@@ -16,7 +16,7 @@ For each beat, write narration that:
 - Adds VALUE on top of the dialogue — interpret, contextualize, foreshadow,
   pay off setups, explain unspoken character motivation. Do not merely
   describe what's literally on screen.
-- Fits the beat's duration: target ≈ durationSec × 2.3 words.
+- Fits the beat's word target shown in the BEAT header (target ~N words). This is critical for sync.
 - Uses the speaker's name when known. Avoid "the protagonist" if you have
   a name.
 - Maintains a consistent narrator voice: confident, knowledgeable, slightly

@@ -175,7 +175,7 @@ router.post('/:id/explainer/run', validateProject, async (req, res, next) => {
         currentStep = 'script';
         project.state.script = 'processing';
         await safeWriteJson(projectPath(req.params.id, 'project.json'), project);
-        const script = await writeExplainerScript(req.params.id, bundleSummary, beats, onStep('script'));
+        const script = await writeExplainerScript(req.params.id, bundleSummary, beats, onStep('script'), { targetReelSec: targetDurationSec });
 
         project.state.script = 'complete';
         project.stats.scriptWordCount = (script.segments || []).reduce(

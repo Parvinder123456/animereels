@@ -10,27 +10,16 @@
  * Output:
  *   data/projects/<id>/output/final.mp4
  *
- * Strategy (same for all three modes — cut/hybrid/continuous — since the
- * upstream clusterer/picker chooses which beats survive):
+ * Strategy:
+ *   For each script segment:
+ *     1. Cut [sourceStart, sourceEnd] from source.mp4.
+ *     2. Speed-adjust the clip so it fills exactly the narration segment's
+ *        duration (setpts=PTS/speed). Clamped to 0.25x–4x.
+ *     3. No source audio — only narration plays over the video.
  *
- *   For each script segment in order:
- *     1. Cut [sourceStart, sourceEnd] from source.mp4 at original speed.
- *     2. If the matching narration segment is LONGER than the source clip,
- *        extend the clip by freezing the last frame to match narration duration.
- *        If shorter, leave clip at source duration (narration leads silence).
- *     3. Each clip is encoded uniformly so the concat demuxer can join them.
- *
- *   Concat → silent timeline → mux with:
- *     - narration (placed at each segment's offset on the merged timeline)
- *     - original source audio ducked to ~18%, pitch-shifted +1% to break
- *       Content ID fingerprints (legitimate transformative use)
+ *   Concat → timeline → mux with:
+ *     - narration audio only (no source audio)
  *     - burned-in subtitles from the narration's word-level timestamps
- *
- * YouTube safety measures baked in:
- *   - Source audio ducked to 18% (Content ID is audio-first)
- *   - Source audio pitched +1% via asetrate/aresample/atempo composition
- *   - OP/ED already removed upstream (most heavily fingerprinted)
- *   - Optional small overlay (project name) for transformative signal
  */
 
 import ffmpeg from 'fluent-ffmpeg';
@@ -52,9 +41,8 @@ const ASPECT_PRESETS = {
 };
 const DEFAULT_ASPECT = '16:9';
 const TARGET_FPS = 25;
-const SOURCE_AUDIO_GAIN = 0.18;
-const NARRATOR_GAIN = 1.0;
-const PITCH_SHIFT = 1.01; // +1% — invisible to viewers, breaks audio fingerprints
+const MIN_SPEED = 0.25;
+const MAX_SPEED = 4.0;
 
 function ffprobeDuration(filePath) {
   return new Promise((resolve, reject) => {
@@ -77,60 +65,58 @@ function resolveDims(aspectKey, sourcePath) {
 }
 
 /**
- * Cut a clip from source. If we need it to be longer than the source
- * window, append a freeze of the last frame to match `extendToSec`.
+ * Cut a clip from source and speed-adjust video so it fills exactly `targetDur`.
+ * Source audio is muted (volume=0) to produce a silent audio track for concat.
+ * The output is hard-trimmed to targetDur so clamped speeds don't create excess.
  */
-async function cutAndOptionallyExtend(srcPath, srcStart, srcEnd, extendToSec, outPath, dims) {
+async function cutWithSpeed(srcPath, srcStart, srcEnd, targetDur, outPath, dims) {
   const srcDur = srcEnd - srcStart;
-  const needExtend = extendToSec && extendToSec > srcDur + 0.05;
+  const rawSpeed = srcDur / targetDur;
+  const speed = Math.min(MAX_SPEED, Math.max(MIN_SPEED, rawSpeed));
+  const effectiveDur = srcDur / speed; // actual output duration after speed adjust
 
-  const vf = [
+  // If speed was clamped, only read what we need from source (avoid excess frames)
+  const readDur = Math.min(srcDur, targetDur * speed);
+
+  // Build atempo chain: ffmpeg atempo only accepts 0.5–100, so chain multiple
+  // stages for extreme slow-downs (speed < 0.5 means atempo > 2).
+  const atempoVal = 1 / speed; // how much to stretch/shrink audio timeline
+  const atempoFilters = [];
+  let remaining = atempoVal;
+  while (remaining > 2.0) { atempoFilters.push('atempo=2.0'); remaining /= 2.0; }
+  while (remaining < 0.5) { atempoFilters.push('atempo=0.5'); remaining /= 0.5; }
+  atempoFilters.push(`atempo=${remaining.toFixed(4)}`);
+
+  const vfChain = [
     `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase`,
     `crop=${dims.width}:${dims.height}`,
     `fps=${TARGET_FPS}`,
     'setsar=1',
+    `setpts=PTS/${speed.toFixed(4)}`,
   ].join(',');
 
-  if (!needExtend) {
-    return new Promise((resolve, reject) => {
-      ffmpeg(srcPath)
-        .setFfmpegPath(getFfmpegPath())
-        .seekInput(srcStart)
-        .duration(srcDur)
-        .outputOptions([
-          '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-pix_fmt', 'yuv420p',
-          '-vf', vf,
-          '-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '2',
-          '-movflags', '+faststart',
-        ])
-        .output(outPath)
-        .on('end', resolve)
-        .on('error', err => reject(new Error(`Beat cut failed: ${err.message}`)))
-        .run();
-    });
-  }
+  const afChain = `volume=0,${atempoFilters.join(',')}`;
 
-  // Extend path: tpad=stop_mode=clone freezes the last frame; the source
-  // audio gets padded with silence so the clip's audio still matches video length.
-  const extra = extendToSec - srcDur;
   return new Promise((resolve, reject) => {
     ffmpeg(srcPath)
       .setFfmpegPath(getFfmpegPath())
       .seekInput(srcStart)
-      .duration(srcDur)
+      .duration(readDur)
       .complexFilter([
-        `[0:v]${vf},tpad=stop_mode=clone:stop_duration=${extra.toFixed(3)}[v]`,
-        `[0:a]apad=pad_dur=${extra.toFixed(3)},atrim=0:${extendToSec.toFixed(3)}[a]`,
+        `[0:v]${vfChain}[v]`,
+        `[0:a]${afChain}[a]`,
       ])
       .outputOptions([
         '-map', '[v]', '-map', '[a]',
+        '-t', targetDur.toFixed(3),   // hard-trim output to exact target duration
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '2',
+        '-c:a', 'aac', '-b:a', '128k',
+        '-shortest',
         '-movflags', '+faststart',
       ])
       .output(outPath)
       .on('end', resolve)
-      .on('error', err => reject(new Error(`Beat cut+extend failed: ${err.message}`)))
+      .on('error', err => reject(new Error(`Beat cut+speed failed: ${err.message}`)))
       .run();
   });
 }
@@ -156,10 +142,8 @@ function concatClips(clipPaths, outPath) {
 }
 
 /**
- * Mux narration over the concatenated source timeline.
- * - Source audio: pitch +1%, gain 0.18
- * - Narration audio: gain 1.0
- * - Burns ASS subtitles (if available)
+ * Mux narration over the video timeline (no source audio).
+ * Burns ASS subtitles if available.
  */
 function muxNarrationAndSubs(timelinePath, narrationPath, subsPath, outPath, detailPreset, dims) {
   return new Promise((resolve, reject) => {
@@ -167,21 +151,17 @@ function muxNarrationAndSubs(timelinePath, narrationPath, subsPath, outPath, det
       ? `,subtitles='${subsPath.replace(/\\/g, '/').replace(/:/g, '\\:')}'`
       : '';
 
-    const pitchChain = `asetrate=48000*${PITCH_SHIFT},aresample=48000,atempo=${(1 / PITCH_SHIFT).toFixed(6)}`;
-
     ffmpeg(timelinePath)
       .setFfmpegPath(getFfmpegPath())
       .input(narrationPath)
       .complexFilter([
         `[0:v]scale=${dims.width}:${dims.height},setsar=1${subFilter}[v]`,
-        `[0:a]${pitchChain},volume=${SOURCE_AUDIO_GAIN}[src]`,
-        `[1:a]volume=${NARRATOR_GAIN}[narr]`,
-        `[src][narr]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[a]`,
       ])
       .outputOptions([
-        '-map', '[v]', '-map', '[a]',
+        '-map', '[v]', '-map', '1:a',
         ...getEncodingOptions(detailPreset),
         '-c:a', 'aac', '-b:a', '192k',
+        '-shortest',
         '-movflags', '+faststart',
       ])
       .output(outPath)
@@ -214,40 +194,58 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
   const beatsDir = projectPath(projectId, 'beats_render');
   await ensureDir(beatsDir);
 
-  // Phase 1: cut + optionally extend each beat.
+  // Phase 1: cut + speed-adjust each beat to fill narration duration (incl. gaps).
+  // Each clip must cover from its narration start to the NEXT segment's start
+  // (to fill breathing-room silences). Last clip covers until narration ends.
   const clipPaths = [];
   for (let i = 0; i < script.segments.length; i++) {
     const seg = script.segments[i];
     const srcStart = Number(seg.sourceStart) || 0;
     const srcEnd   = Number(seg.sourceEnd)   || (srcStart + 5);
-    const boundary = segmentBoundaries[i] || segmentBoundaries[i + 1];
-    const narrSec  = boundary ? Math.max(0.1, boundary.endTime - boundary.startTime) : (srcEnd - srcStart);
+    const boundary = segmentBoundaries[i];
+    const nextBoundary = segmentBoundaries[i + 1];
+
+    let narrSec;
+    if (boundary && nextBoundary) {
+      // Fill from this segment's start to the next segment's start (covers gap)
+      narrSec = Math.max(0.5, nextBoundary.startTime - boundary.startTime);
+    } else if (boundary) {
+      // Last segment: fill from start to narration end
+      narrSec = Math.max(0.5, narrationDur - boundary.startTime);
+    } else {
+      // No boundary data — fall back to source duration (shouldn't happen)
+      narrSec = srcEnd - srcStart;
+      logger.warn(`[videoExplainerRenderer] No boundary for segment ${i} — using source duration ${narrSec.toFixed(1)}s`);
+    }
+
+    const srcDur = srcEnd - srcStart;
+    const speed = (srcDur / narrSec).toFixed(2);
 
     onProgress(
       `Cutting beat ${i + 1}/${script.segments.length} ` +
-      `(src ${(srcEnd - srcStart).toFixed(1)}s, narr ${narrSec.toFixed(1)}s)`,
+      `(src ${srcDur.toFixed(1)}s → narr ${narrSec.toFixed(1)}s, ${speed}x)`,
       Math.round((i / script.segments.length) * 70)
     );
 
     const outPath = path.join(beatsDir, `beat_${String(i).padStart(4, '0')}.mp4`);
-    await cutAndOptionallyExtend(sourcePath, srcStart, srcEnd, narrSec, outPath, dims);
+    await cutWithSpeed(sourcePath, srcStart, srcEnd, narrSec, outPath, dims);
     clipPaths.push(outPath);
   }
 
-  // Phase 2: concat into silent timeline (still has source audio per clip).
+  // Phase 2: concat into timeline (silent audio tracks from cutWithSpeed).
   onProgress('Concatenating timeline...', 75);
   const timelinePath = projectPath(projectId, 'explainer-timeline.mp4');
   await concatClips(clipPaths, timelinePath);
 
   // Phase 3: subtitles.
   onProgress('Generating subtitles from narration timestamps...', 85);
+  await ensureDir(projectPath(projectId, 'output'));
   let subsPath = null;
   try { subsPath = await generateProjectSubtitles(projectId, timestamps); }
   catch (err) { logger.warn(`[videoExplainerRenderer] subtitle gen failed: ${err.message} — rendering without subs`); }
 
-  // Phase 4: final mux — narration dominant, source ducked + pitch-shifted.
-  onProgress('Muxing narration + ducked source audio + subtitles...', 92);
-  await ensureDir(projectPath(projectId, 'output'));
+  // Phase 4: final mux — narration only (no source audio).
+  onProgress('Muxing narration + subtitles...', 92);
   const finalPath = projectPath(projectId, 'output', 'final.mp4');
   await muxNarrationAndSubs(timelinePath, narrationPath, subsPath, finalPath, detail, dims);
 
