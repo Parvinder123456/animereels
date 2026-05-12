@@ -347,4 +347,68 @@ router.post('/:id/explainer/run', validateProject, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ─── GET /:id/explainer/preview ──────────────────────────────────────────────
+// Returns the artifacts produced by the analysis step so the user can review
+// the script + selected scenes + skip windows BEFORE running voice + render.
+
+router.get('/:id/explainer/preview', validateProject, async (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const [script, beats, bundleEnv, opEd] = await Promise.all([
+      safeReadJson(projectPath(id, 'script.json'),       null),
+      safeReadJson(projectPath(id, 'beats.json'),        null),
+      safeReadJson(projectPath(id, 'bundle-summary.json'), null),
+      safeReadJson(projectPath(id, 'op-ed-cuts.json'),   null),
+    ]);
+
+    // bundle-summary.json now wraps the bundle under .bundle (post source-identity cache).
+    // Old projects may have it at the top level.
+    const bundle = bundleEnv?.bundle || bundleEnv || null;
+
+    const segments = script?.segments || [];
+    const stats = {
+      sceneCount: segments.length,
+      totalWords: segments.reduce((n, s) => n + (s.text ? s.text.split(/\s+/).filter(Boolean).length : 0), 0),
+      sourceDurationSec: beats?.totalSec || null,
+      mode: beats?.mode || null,
+      targetDurationSec: beats?.targetDurationSec || null,
+      coveredDurationSec: segments.length ? segments[segments.length - 1].sourceEnd - segments[0].sourceStart : 0,
+    };
+
+    // Join script segments with their corresponding scene metadata from beats.json
+    // so the UI can show "visual + dialogue + narration" in one row.
+    const scenesByIdx = new Map((beats?.scenes || []).map(s => [s.idx, s]));
+    const rows = segments.map((seg, i) => {
+      const scene = scenesByIdx.get(seg.sceneIndex ?? i) || {};
+      return {
+        sceneIndex: seg.sceneIndex ?? i,
+        sourceStart: seg.sourceStart,
+        sourceEnd: seg.sourceEnd,
+        durationSec: seg.sourceEnd - seg.sourceStart,
+        type: scene.type || null,
+        mood: seg.mood || scene.mood || null,
+        importance: scene.importance || null,
+        characters: scene.characters || [],
+        visualDescription: scene.visualDescription || null,
+        dialogueGist: scene.dialogueGist || null,
+        dialogueVerbatim: scene.dialogueVerbatim || null,
+        narration: seg.text || '',
+      };
+    });
+
+    res.json({
+      title: script?.title || null,
+      hook: script?.hook || null,
+      stats,
+      bundle,
+      skipWindows: {
+        op: opEd?.opCuts || [],
+        ed: opEd?.edCuts || [],
+        manual: req.project?.config?.manualSkipWindows || [],
+      },
+      scenes: rows,
+    });
+  } catch (err) { next(err); }
+});
+
 export default router;

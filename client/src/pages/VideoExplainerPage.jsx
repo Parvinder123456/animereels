@@ -53,6 +53,9 @@ export default function VideoExplainerPage() {
   const [skipWindowsText, setSkipWindowsText] = useState('');
   const fileInputRef = useRef(null);
   const [fileNames, setFileNames] = useState([]);
+  const [preview, setPreview] = useState(null);
+  const [previewOpen, setPreviewOpen] = useState(true);
+  const [expandedScenes, setExpandedScenes] = useState(new Set());
 
   useEffect(() => {
     reload();
@@ -72,6 +75,40 @@ export default function VideoExplainerPage() {
   async function reload() {
     try { setProject(await get(`/projects/${id}`)); }
     catch (e) { setError(e.message); }
+  }
+
+  async function loadPreview() {
+    try { setPreview(await get(`/projects/${id}/explainer/preview`)); }
+    catch (e) { /* preview unavailable until analysis completes; ignore */ }
+  }
+
+  // Auto-load preview when analysis finishes (state.script flips to complete).
+  useEffect(() => {
+    if (project?.state?.script === 'complete') loadPreview();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.state?.script, project?.updatedAt]);
+
+  function toggleScene(idx) {
+    setExpandedScenes(prev => {
+      const next = new Set(prev);
+      if (next.has(idx)) next.delete(idx); else next.add(idx);
+      return next;
+    });
+  }
+
+  async function regenerateScript() {
+    setError(null); setBusy(true);
+    try {
+      // force=false keeps scene-plan/bundle/op-ed caches; only selection + script re-run.
+      await post(`/projects/${id}/explainer/run`, {
+        targetDurationSec: Math.max(60, Number(targetMinutes) * 60),
+        language: 'en',
+        force: false,
+        manualSkipWindows: skipWindowsText.trim(),
+      });
+      await reload();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
   }
 
   function fmtTime(sec) {
@@ -236,6 +273,136 @@ export default function VideoExplainerPage() {
         </div>
         {analyzeDone && <div style={styles.progress}>✓ Script + scenes ready</div>}
       </div>
+
+      {analyzeDone && preview && (
+        <div style={styles.card}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={styles.step}>Analysis preview — what the narrator will say + what scenes will play</div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button type="button" className="btn-secondary" onClick={regenerateScript} disabled={busy}>
+                Re-generate script (keep scene plan)
+              </button>
+              <button type="button" className="btn-secondary" onClick={() => setPreviewOpen(o => !o)}>
+                {previewOpen ? 'Collapse' : 'Expand'}
+              </button>
+            </div>
+          </div>
+
+          {previewOpen && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div>
+                <div style={{ fontSize: 18, fontWeight: 600 }}>{preview.title || '(untitled)'}</div>
+                {preview.hook && <div style={{ fontStyle: 'italic', color: 'var(--text-secondary)', marginTop: 4 }}>"{preview.hook}"</div>}
+              </div>
+
+              <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, color: 'var(--text-muted)' }}>
+                <span>{preview.stats.sceneCount} scenes</span>
+                <span>{preview.stats.totalWords} words</span>
+                {preview.stats.mode && <span>mode: {preview.stats.mode}</span>}
+                {preview.stats.sourceDurationSec && <span>source: {fmtTime(preview.stats.sourceDurationSec)}</span>}
+                {preview.stats.targetDurationSec && <span>target: {fmtTime(preview.stats.targetDurationSec)}</span>}
+                {preview.stats.coveredDurationSec > 0 && <span>covered: {fmtTime(preview.stats.coveredDurationSec)}</span>}
+              </div>
+
+              {preview.bundle && (
+                <details>
+                  <summary style={{ cursor: 'pointer', fontSize: 13, color: 'var(--text-secondary)' }}>
+                    Story arc + characters (the narrator's full context)
+                  </summary>
+                  <div style={{ padding: '8px 0', display: 'flex', flexDirection: 'column', gap: 8, fontSize: 12, color: 'var(--text-secondary)' }}>
+                    {preview.bundle.arcSummary && (
+                      <div><strong>Arc:</strong> {preview.bundle.arcSummary}</div>
+                    )}
+                    {Array.isArray(preview.bundle.characters) && preview.bundle.characters.length > 0 && (
+                      <div>
+                        <strong>Characters:</strong>
+                        <ul style={{ marginTop: 4, paddingLeft: 18, lineHeight: 1.5 }}>
+                          {preview.bundle.characters.map((c, i) => (
+                            <li key={i}><strong>{c.name}:</strong> {c.role}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {Array.isArray(preview.bundle.episodeRecap) && preview.bundle.episodeRecap.length > 0 && (
+                      <div>
+                        <strong>Episode recap:</strong>
+                        <ul style={{ marginTop: 4, paddingLeft: 18, lineHeight: 1.5 }}>
+                          {preview.bundle.episodeRecap.map((e, i) => (
+                            <li key={i}>Ep {e.episodeIdx + 1} — {e.title}: {e.oneLine}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {Array.isArray(preview.bundle.throughLines) && preview.bundle.throughLines.length > 0 && (
+                      <div><strong>Through lines:</strong> {preview.bundle.throughLines.join('; ')}</div>
+                    )}
+                    {preview.bundle.endsOn && <div><strong>Ends on:</strong> {preview.bundle.endsOn}</div>}
+                  </div>
+                </details>
+              )}
+
+              {((preview.skipWindows.op?.length || 0) + (preview.skipWindows.ed?.length || 0) + (preview.skipWindows.manual?.length || 0)) > 0 && (
+                <details>
+                  <summary style={{ cursor: 'pointer', fontSize: 13, color: 'var(--text-secondary)' }}>
+                    Skip windows applied ({(preview.skipWindows.op?.length || 0) + (preview.skipWindows.ed?.length || 0)} auto + {preview.skipWindows.manual?.length || 0} manual)
+                  </summary>
+                  <div style={{ padding: '8px 0', fontSize: 12, fontFamily: 'monospace', color: 'var(--text-secondary)' }}>
+                    {(preview.skipWindows.op || []).map((w, i) => <div key={`op-${i}`}>OP  {fmtTime(w.startSec)}–{fmtTime(w.endSec)}</div>)}
+                    {(preview.skipWindows.ed || []).map((w, i) => <div key={`ed-${i}`}>ED  {fmtTime(w.startSec)}–{fmtTime(w.endSec)}</div>)}
+                    {(preview.skipWindows.manual || []).map((w, i) => <div key={`m-${i}`}>MAN {fmtTime(w.startSec)}–{fmtTime(w.endSec)}</div>)}
+                  </div>
+                </details>
+              )}
+
+              <div style={{ borderTop: '1px solid var(--glass-border)', paddingTop: 12 }}>
+                <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 8 }}>
+                  Per-scene breakdown ({preview.scenes.length}) — click a row to expand
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 600, overflowY: 'auto', paddingRight: 4 }}>
+                  {preview.scenes.map(sc => {
+                    const isOpen = expandedScenes.has(sc.sceneIndex);
+                    return (
+                      <div key={sc.sceneIndex} style={{
+                        border: '1px solid var(--glass-border)', borderRadius: 6,
+                        padding: '8px 12px', background: 'rgba(255,255,255,0.02)',
+                      }}>
+                        <div
+                          onClick={() => toggleScene(sc.sceneIndex)}
+                          style={{ cursor: 'pointer', display: 'flex', gap: 12, alignItems: 'center', fontSize: 12 }}
+                        >
+                          <span style={{ color: 'var(--text-muted)', minWidth: 28, textAlign: 'right' }}>#{sc.sceneIndex}</span>
+                          <span style={{ color: 'var(--text-muted)', fontFamily: 'monospace', minWidth: 110 }}>
+                            {fmtTime(sc.sourceStart)}–{fmtTime(sc.sourceEnd)}
+                          </span>
+                          <span style={{ color: 'var(--text-muted)', minWidth: 40 }}>{Math.round(sc.durationSec)}s</span>
+                          {sc.mood && <span style={{ color: 'var(--accent-purple)', minWidth: 70 }}>{sc.mood}</span>}
+                          <span style={{ flex: 1, color: 'var(--text-primary)' }}>
+                            {(sc.narration || '').slice(0, 110)}{(sc.narration || '').length > 110 ? '…' : ''}
+                          </span>
+                          <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>{isOpen ? '▼' : '▶'}</span>
+                        </div>
+                        {isOpen && (
+                          <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--glass-border)', fontSize: 12, color: 'var(--text-secondary)', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                            {sc.visualDescription && <div><strong style={{ color: 'var(--accent-cyan)' }}>VISUAL:</strong> {sc.visualDescription}</div>}
+                            {sc.dialogueGist && <div><strong style={{ color: 'var(--accent-cyan)' }}>SAYS:</strong> {sc.dialogueGist}</div>}
+                            {sc.dialogueVerbatim && <div><strong style={{ color: 'var(--accent-cyan)' }}>VERBATIM:</strong> {sc.dialogueVerbatim}</div>}
+                            {Array.isArray(sc.characters) && sc.characters.length > 0 && (
+                              <div><strong style={{ color: 'var(--accent-cyan)' }}>CHARACTERS:</strong> {sc.characters.join(', ')}</div>
+                            )}
+                            <div style={{ marginTop: 4, padding: 8, background: 'rgba(139,92,246,0.08)', borderRadius: 4, color: 'var(--text-primary)', lineHeight: 1.5 }}>
+                              <strong style={{ color: 'var(--accent-purple)' }}>NARRATION:</strong> {sc.narration || '(empty)'}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       <div style={styles.card}>
         <div style={styles.step}>3 · Generate narration</div>
