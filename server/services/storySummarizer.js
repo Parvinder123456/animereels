@@ -19,8 +19,41 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { textQuery } from '../utils/textClient.js';
 import { retry } from '../utils/retry.js';
-import { safeWriteJson, projectPath } from '../utils/fileHelpers.js';
+import {
+  safeReadJson, safeWriteJson, projectPath, fileExists,
+} from '../utils/fileHelpers.js';
 import { logger } from '../utils/logger.js';
+
+// ─── Source-identity cache (same scheme as opEdDetector + geminiVideoBreakdown) ──
+
+async function sourceIdentity(sourcePath) {
+  const stat = await fs.stat(sourcePath);
+  return { size: stat.size, mtimeMs: Math.round(stat.mtimeMs) };
+}
+
+function identityMatches(a, b) {
+  return !!a && !!b && a.size === b.size && a.mtimeMs === b.mtimeMs;
+}
+
+export async function loadCachedEpisodeSummaries(projectId, sourcePath) {
+  const p = projectPath(projectId, 'episode-summaries.json');
+  if (!await fileExists(p)) return null;
+  const cached = await safeReadJson(p);
+  if (!cached?.summaries?.length || !cached.sourceIdentity) return null;
+  const current = await sourceIdentity(sourcePath).catch(() => null);
+  if (!identityMatches(cached.sourceIdentity, current)) return null;
+  return cached.summaries;
+}
+
+export async function loadCachedBundleSummary(projectId, sourcePath) {
+  const p = projectPath(projectId, 'bundle-summary.json');
+  if (!await fileExists(p)) return null;
+  const cached = await safeReadJson(p);
+  if (!cached?.bundle || !cached.sourceIdentity) return null;
+  const current = await sourceIdentity(sourcePath).catch(() => null);
+  if (!identityMatches(cached.sourceIdentity, current)) return null;
+  return cached.bundle;
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const EPISODE_PROMPT_PATH = path.resolve(__dirname, '..', '..', 'prompts', 'episode-summary.v1.md');
@@ -50,7 +83,7 @@ function formatSegments(segments) {
  * @param {Array<{idx, startSec, durationSec}>} episodes
  * @param {Array<{startSec, endSec}>} skipWindows  to exclude OP/ED dialogue noise
  */
-export async function summarizeEpisodes(projectId, transcriptSegments, episodes, skipWindows = [], onProgress = () => {}) {
+export async function summarizeEpisodes(projectId, transcriptSegments, episodes, skipWindows = [], onProgress = () => {}, { sourcePath } = {}) {
   const promptTemplate = await readPrompt(EPISODE_PROMPT_PATH,
     'Summarize this episode transcript. Return JSON {episodeIdx,title,characters,plotArc,keyMoments,themes,unresolved}.');
 
@@ -94,7 +127,12 @@ export async function summarizeEpisodes(projectId, transcriptSegments, episodes,
     perEpisodeSummaries.push(summary);
   }
 
-  await safeWriteJson(projectPath(projectId, 'episode-summaries.json'), perEpisodeSummaries);
+  const sid = sourcePath ? await sourceIdentity(sourcePath).catch(() => null) : null;
+  await safeWriteJson(projectPath(projectId, 'episode-summaries.json'), {
+    summaries: perEpisodeSummaries,
+    sourceIdentity: sid,
+    cachedAt: new Date().toISOString(),
+  });
   logger.info(`[storySummarizer] wrote ${perEpisodeSummaries.length} episode summaries`);
   return perEpisodeSummaries;
 }
@@ -103,7 +141,7 @@ export async function summarizeEpisodes(projectId, transcriptSegments, episodes,
  * @param {string} projectId
  * @param {Array<object>} perEpisodeSummaries
  */
-export async function summarizeBundle(projectId, perEpisodeSummaries, onProgress = () => {}) {
+export async function summarizeBundle(projectId, perEpisodeSummaries, onProgress = () => {}, { sourcePath } = {}) {
   const promptTemplate = await readPrompt(BUNDLE_PROMPT_PATH,
     'Combine these episode summaries into one bundle arc. Return JSON {bundleTitle,characters,arcSummary,episodeRecap,throughLines,endsOn}.');
 
@@ -126,7 +164,12 @@ export async function summarizeBundle(projectId, perEpisodeSummaries, onProgress
     };
   }
 
-  await safeWriteJson(projectPath(projectId, 'bundle-summary.json'), bundle);
+  const sid = sourcePath ? await sourceIdentity(sourcePath).catch(() => null) : null;
+  await safeWriteJson(projectPath(projectId, 'bundle-summary.json'), {
+    bundle,
+    sourceIdentity: sid,
+    cachedAt: new Date().toISOString(),
+  });
   onProgress('Bundle summary complete', 100);
   logger.info(`[storySummarizer] bundle summary written: "${bundle.bundleTitle}"`);
   return bundle;

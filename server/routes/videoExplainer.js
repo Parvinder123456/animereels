@@ -32,8 +32,31 @@ import { stitchEpisodes } from '../services/videoStitcher.js';
 import { detectOpEd, mergeSkipWindows, loadCachedOpEd } from '../services/opEdDetector.js';
 import { breakDownVideo, loadCachedPlan } from '../services/geminiVideoBreakdown.js';
 import { selectScenes, pickMode } from '../services/sceneSelector.js';
+import {
+  summarizeEpisodes, summarizeBundle,
+  loadCachedEpisodeSummaries, loadCachedBundleSummary,
+} from '../services/storySummarizer.js';
 import { writeExplainerScript } from '../services/explainerScriptWriter.js';
 import { logger } from '../utils/logger.js';
+
+/**
+ * Adapt Gemini scene-plan scenes into the {start, end, text} segment
+ * shape that storySummarizer expects. We pack VISUAL + DIALOGUE per
+ * segment so the summarizer sees what's happening on screen alongside
+ * what's being said — gives it real story understanding, not just
+ * dialogue paraphrasing.
+ */
+function scenesToTranscriptLikeSegments(scenes) {
+  return scenes.map(s => ({
+    start: s.startSec,
+    end: s.endSec,
+    text: [
+      `[VISUAL] ${s.visualDescription || '(unspecified)'}`,
+      s.dialogueGist ? `[GIST] ${s.dialogueGist}` : '',
+      s.dialogueVerbatim ? `[SAYS] ${s.dialogueVerbatim}` : '',
+    ].filter(Boolean).join(' '),
+  }));
+}
 
 const router = Router();
 
@@ -178,10 +201,49 @@ router.post('/:id/explainer/run', validateProject, async (req, res, next) => {
         }
         if (!plan.scenes?.length) throw new Error('Scene breakdown returned zero scenes — source unreadable?');
 
-        // 3. Mode pick + scene selection to fit target duration.
+        // 3. Story summarization (RESTORED — this is what makes the narrator
+        // sound good). Per-episode summaries → bundle summary. We feed each
+        // scene's visual+dialogue context to the summarizer so it understands
+        // both what's seen and what's said. Cached by source identity.
+        let epSummaries = null;
+        if (!force) {
+          epSummaries = await loadCachedEpisodeSummaries(req.params.id, sourcePath);
+          if (epSummaries) {
+            onStep('panels')(`Episode summaries cache hit (${epSummaries.length}) — skipping`, 82);
+            logger.info(`[videoExplainer] episode-summaries cache hit: ${epSummaries.length}`);
+          }
+        }
+        if (!epSummaries) {
+          onStep('panels')('Summarizing each episode for narrator context...', 82);
+          const sceneSegments = scenesToTranscriptLikeSegments(plan.scenes);
+          epSummaries = await summarizeEpisodes(
+            req.params.id, sceneSegments, episodes, skipWindows,
+            (msg, pct) => onStep('panels')(msg, 82 + Math.round(pct * 0.05)),
+            { sourcePath }
+          );
+        }
+
+        let bundleSummary = null;
+        if (!force) {
+          bundleSummary = await loadCachedBundleSummary(req.params.id, sourcePath);
+          if (bundleSummary) {
+            onStep('panels')(`Bundle summary cache hit ("${bundleSummary.bundleTitle}") — skipping`, 88);
+            logger.info(`[videoExplainer] bundle-summary cache hit: "${bundleSummary.bundleTitle}"`);
+          }
+        }
+        if (!bundleSummary) {
+          onStep('panels')('Combining into bundle arc summary...', 88);
+          bundleSummary = await summarizeBundle(
+            req.params.id, epSummaries,
+            (msg, pct) => onStep('panels')(msg, 88 + Math.round(pct * 0.02)),
+            { sourcePath }
+          );
+        }
+
+        // 4. Mode pick + scene selection to fit target duration.
         const mode = pickMode(totalSec, targetDurationSec);
         logger.info(`[videoExplainer] mode=${mode} (source=${(totalSec/60).toFixed(1)}min → target=${(targetDurationSec/60).toFixed(1)}min)`);
-        onStep('panels')(`Selecting scenes (mode=${mode})...`, 84);
+        onStep('panels')(`Selecting scenes (mode=${mode})...`, 92);
         const chosenScenes = selectScenes(plan.scenes, targetDurationSec, mode);
         if (!chosenScenes.length) throw new Error('Scene selector returned zero scenes');
         await safeWriteJson(projectPath(req.params.id, 'beats.json'), { mode, totalSec, targetDurationSec, scenes: chosenScenes });
@@ -191,26 +253,14 @@ router.post('/:id/explainer/run', validateProject, async (req, res, next) => {
         await safeWriteJson(projectPath(req.params.id, 'project.json'), project);
         emit(req.params.id, 'panels', `Scene selection complete: ${chosenScenes.length} scenes`, 100);
 
-        // 4. Narrator script writer with visual + dialogue context per scene.
+        // 5. Narrator script writer with FULL story context + visual scene context.
         currentStep = 'script';
         project.state.script = 'processing';
         await safeWriteJson(projectPath(req.params.id, 'project.json'), project);
 
-        // Lightweight cross-scene hints derived from the plan itself.
-        const charCounts = {};
-        for (const s of plan.scenes) for (const c of (s.characters || [])) {
-          charCounts[c] = (charCounts[c] || 0) + 1;
-        }
-        const bundleHints = {
-          bundleTitle: project.name || 'Anime Explainer',
-          arcOverview: plan.scenes.slice(0, 3).map(s => s.visualDescription).filter(Boolean).join(' / '),
-          throughLines: Object.entries(charCounts).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([c]) => c),
-          endsOn: plan.scenes.slice(-1)[0]?.visualDescription || '',
-        };
-
         const script = await writeExplainerScript(
           req.params.id, chosenScenes, onStep('script'),
-          { targetReelSec: targetDurationSec, bundleHints }
+          { targetReelSec: targetDurationSec, bundleSummary }
         );
 
         project.state.script = 'complete';

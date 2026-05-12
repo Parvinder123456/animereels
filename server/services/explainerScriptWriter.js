@@ -68,10 +68,12 @@ function chunk(arr, size) {
  * @param {Function} onProgress
  * @param {object} opts
  * @param {number} opts.targetReelSec   total target reel duration for word budgeting
- * @param {object} opts.bundleHints     optional: { bundleTitle, characters, throughLines, endsOn }
- *                                       derived from the scene plan, gives the writer cross-scene context
+ * @param {object} opts.bundleSummary   from storySummarizer.summarizeBundle —
+ *                                       { bundleTitle, arcSummary, characters,
+ *                                         episodeRecap, throughLines, endsOn }
+ *                                       Gives the narrator real story context.
  */
-export async function writeExplainerScript(projectId, scenes, onProgress = () => {}, { targetReelSec, bundleHints } = {}) {
+export async function writeExplainerScript(projectId, scenes, onProgress = () => {}, { targetReelSec, bundleSummary } = {}) {
   if (!scenes.length) throw new Error('No scenes to write narration for');
   const promptTemplate = await getPrompt();
 
@@ -89,24 +91,27 @@ export async function writeExplainerScript(projectId, scenes, onProgress = () =>
     `[explainerScriptWriter] target=${effectiveTarget.toFixed(0)}s totalWords=${totalWords} scenes=${scenes.length}`
   );
 
-  // Cross-scene context block. Derived from the scene plan (top characters,
-  // arc-spanning info) so the narrator doesn't reintroduce known faces every scene.
-  const charCounts = {};
-  for (const s of scenes) for (const c of (s.characters || [])) {
-    charCounts[c] = (charCounts[c] || 0) + 1;
-  }
-  const topChars = Object.entries(charCounts).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([c]) => c);
+  // Rich story context — the bundleSummary is the difference between bland,
+  // dialogue-paraphrasing narration and narration that knows the arc, recalls
+  // setups, foreshadows reveals, and uses character names confidently.
+  const charactersBlock = (bundleSummary?.characters || [])
+    .map(c => `- ${c.name}: ${c.role}`)
+    .join('\n') || '(infer from scenes)';
+  const episodeBlock = (bundleSummary?.episodeRecap || [])
+    .map(e => `  - Episode ${e.episodeIdx + 1}: ${e.title || ''} — ${e.oneLine || ''}`)
+    .join('\n');
 
   const contextBlock =
-    `BUNDLE TITLE: ${bundleHints?.bundleTitle || 'Anime Explainer'}\n` +
-    `RECURRING CHARACTERS: ${topChars.join(', ') || '(infer from scenes)'}\n` +
-    `ARC OVERVIEW: ${bundleHints?.arcOverview || '(infer from scenes in order)'}\n` +
-    `THROUGH LINES: ${(bundleHints?.throughLines || []).join('; ')}\n` +
-    `ENDS ON: ${bundleHints?.endsOn || ''}\n`;
+    `BUNDLE TITLE: ${bundleSummary?.bundleTitle || 'Anime Explainer'}\n\n` +
+    `ARC SUMMARY:\n${bundleSummary?.arcSummary || '(infer from scenes in order)'}\n\n` +
+    `CHARACTERS:\n${charactersBlock}\n\n` +
+    (episodeBlock ? `EPISODE RECAP:\n${episodeBlock}\n\n` : '') +
+    `THROUGH LINES: ${(bundleSummary?.throughLines || []).join('; ')}\n` +
+    `ENDS ON: ${bundleSummary?.endsOn || ''}\n`;
 
   const batches = chunk(scenes, BATCH_SIZE);
   const allSegments = [];
-  let title = bundleHints?.bundleTitle || 'Anime Explainer';
+  let title = bundleSummary?.bundleTitle || 'Anime Explainer';
   let hook  = '';
 
   for (let b = 0; b < batches.length; b++) {
