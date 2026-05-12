@@ -6,9 +6,15 @@
  *     Server stitches into source.mp4 and writes episodes.json.
  *
  *   POST /api/projects/:id/explainer/run
- *     Body: { targetDurationSec, language? = 'en' }
- *     Runs: OP/ED detect → chunked Whisper → per-episode summaries →
- *           bundle summary → beat clustering → mode pick → explainer script.
+ *     Body: { targetDurationSec }
+ *     Pipeline:
+ *       1. OP/ED detect (Gemini audio fingerprint match)
+ *       2. Gemini multimodal visual+audio breakdown of source → scene plan
+ *          (each scene has visualDescription + dialogueGist + mood + importance,
+ *           anchored to real visual cuts — NOT dialogue boundaries)
+ *       3. Scene selector — pick scenes to fit the target duration
+ *       4. Narrator script writer — produces narration that MATCHES the
+ *          visual on screen, not just what's being said
  *     After this, the existing /voice/generate + /render endpoints finish
  *     the pipeline (render branches on projectType === 'video_explainer').
  */
@@ -24,9 +30,8 @@ import {
 import { runJob, emit, isRunning } from '../jobs/processor.js';
 import { stitchEpisodes } from '../services/videoStitcher.js';
 import { detectOpEd, mergeSkipWindows } from '../services/opEdDetector.js';
-import { transcribeChunked } from '../services/chunkedTranscribe.js';
-import { clusterIntoBeats, pickBeatsForCutMode, pickMode } from '../services/beatClusterer.js';
-import { summarizeEpisodes, summarizeBundle } from '../services/storySummarizer.js';
+import { breakDownVideo } from '../services/geminiVideoBreakdown.js';
+import { selectScenes, pickMode } from '../services/sceneSelector.js';
 import { writeExplainerScript } from '../services/explainerScriptWriter.js';
 import { logger } from '../utils/logger.js';
 
@@ -129,53 +134,58 @@ router.post('/:id/explainer/run', validateProject, async (req, res, next) => {
         project.state.panels = 'processing';
         await safeWriteJson(projectPath(req.params.id, 'project.json'), project);
 
-        // 1. OP/ED detect (auto, ~2 Gemini calls).
+        const totalSec = episodes.reduce((s, e) => s + e.durationSec, 0);
+
+        // 1. OP/ED detect (Gemini audio fingerprint match across episode boundaries).
         onStep('panels')('Detecting OP/ED themes...', 2);
         const { opCuts, edCuts } = await detectOpEd(req.params.id, sourcePath, episodes, (msg, pct) =>
-          onStep('panels')(msg, 2 + Math.round(pct * 0.10))
+          onStep('panels')(msg, 2 + Math.round(pct * 0.08))
         );
         const skipWindows = mergeSkipWindows(opCuts, edCuts);
 
-        // 2. Chunked Whisper transcription of the full stitched source.
-        onStep('panels')('Transcribing full source (chunked)...', 15);
-        const totalSec = episodes.reduce((s, e) => s + e.durationSec, 0);
-        const transcript = await transcribeChunked(req.params.id, sourcePath, totalSec, { language }, (msg, pct) =>
-          onStep('panels')(msg, 15 + Math.round(pct * 0.45))
+        // 2. Gemini multimodal visual+audio breakdown. Each scene's boundaries
+        // are anchored to ACTUAL visual cuts and carry both visualDescription
+        // and dialogue context — the basis of the visuals/narration sync.
+        onStep('panels')('Gemini multimodal scene breakdown (visual + audio)...', 12);
+        const plan = await breakDownVideo(req.params.id, sourcePath, totalSec, skipWindows, (msg, pct) =>
+          onStep('panels')(msg, 12 + Math.round(pct * 0.70))
         );
-        if (!transcript.segments?.length) throw new Error('Whisper returned zero segments — bad source audio?');
+        if (!plan.scenes?.length) throw new Error('Scene breakdown returned zero scenes — source unreadable?');
 
-        // 3. Per-episode summaries → bundle summary.
-        onStep('panels')('Summarizing each episode...', 62);
-        const epSummaries = await summarizeEpisodes(req.params.id, transcript.segments, episodes, skipWindows, (msg, pct) =>
-          onStep('panels')(msg, 62 + Math.round(pct * 0.13))
-        );
-
-        onStep('panels')('Combining episodes into bundle summary...', 78);
-        const bundleSummary = await summarizeBundle(req.params.id, epSummaries, (msg, pct) =>
-          onStep('panels')(msg, 78 + Math.round(pct * 0.05))
-        );
-
-        // 4. Beat clustering + mode pick.
+        // 3. Mode pick + scene selection to fit target duration.
         const mode = pickMode(totalSec, targetDurationSec);
         logger.info(`[videoExplainer] mode=${mode} (source=${(totalSec/60).toFixed(1)}min → target=${(targetDurationSec/60).toFixed(1)}min)`);
-        onStep('panels')(`Clustering into beats (mode=${mode})...`, 85);
-        let beats = clusterIntoBeats(transcript.segments, episodes, skipWindows, mode);
-
-        if (mode === 'cut') {
-          beats = pickBeatsForCutMode(beats, targetDurationSec, episodes);
-        }
-        await safeWriteJson(projectPath(req.params.id, 'beats.json'), { mode, totalSec, targetDurationSec, beats });
+        onStep('panels')(`Selecting scenes (mode=${mode})...`, 84);
+        const chosenScenes = selectScenes(plan.scenes, targetDurationSec, mode);
+        if (!chosenScenes.length) throw new Error('Scene selector returned zero scenes');
+        await safeWriteJson(projectPath(req.params.id, 'beats.json'), { mode, totalSec, targetDurationSec, scenes: chosenScenes });
 
         project.state.panels = 'complete';
-        project.stats.panelCount = beats.length;
+        project.stats.panelCount = chosenScenes.length;
         await safeWriteJson(projectPath(req.params.id, 'project.json'), project);
-        emit(req.params.id, 'panels', `Clustering complete: ${beats.length} beats`, 100);
+        emit(req.params.id, 'panels', `Scene selection complete: ${chosenScenes.length} scenes`, 100);
 
-        // 5. Per-beat narrator script.
+        // 4. Narrator script writer with visual + dialogue context per scene.
         currentStep = 'script';
         project.state.script = 'processing';
         await safeWriteJson(projectPath(req.params.id, 'project.json'), project);
-        const script = await writeExplainerScript(req.params.id, bundleSummary, beats, onStep('script'), { targetReelSec: targetDurationSec });
+
+        // Lightweight cross-scene hints derived from the plan itself.
+        const charCounts = {};
+        for (const s of plan.scenes) for (const c of (s.characters || [])) {
+          charCounts[c] = (charCounts[c] || 0) + 1;
+        }
+        const bundleHints = {
+          bundleTitle: project.name || 'Anime Explainer',
+          arcOverview: plan.scenes.slice(0, 3).map(s => s.visualDescription).filter(Boolean).join(' / '),
+          throughLines: Object.entries(charCounts).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([c]) => c),
+          endsOn: plan.scenes.slice(-1)[0]?.visualDescription || '',
+        };
+
+        const script = await writeExplainerScript(
+          req.params.id, chosenScenes, onStep('script'),
+          { targetReelSec: targetDurationSec, bundleHints }
+        );
 
         project.state.script = 'complete';
         project.stats.scriptWordCount = (script.segments || []).reduce(

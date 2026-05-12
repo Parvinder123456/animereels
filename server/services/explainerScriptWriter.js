@@ -1,13 +1,15 @@
 /**
- * Write the per-beat narrator script for a video_explainer project.
+ * Write the narrator script for a video_explainer project.
  *
- * Receives the bundle summary (story context) + the chosen beats (each
- * with verbatim dialogue from the transcript), produces one narration
- * segment per beat. The prompt makes the narrator aware of the full
- * story so it can foreshadow, recall, and explain motivation rather
- * than just describe what's on screen.
+ * Input: scenes from the Gemini visual breakdown + sceneSelector. Each
+ * scene carries both VISUAL context and dialogue context, so the narrator
+ * can write commentary that MATCHES what's on screen instead of what
+ * dialogue happens to say.
  *
- * For long bundles (40+ beats) we batch into windows of ~15 beats per
+ * Output (script.json): the standard render contract:
+ *   { title, hook, segments: [{ sceneIndex, sourceStart, sourceEnd, text, mood }] }
+ *
+ * For long projects (40+ scenes) we batch into windows of ~12 scenes per
  * call so the LLM stays focused and the output JSON doesn't truncate.
  */
 
@@ -22,12 +24,12 @@ import { logger } from '../utils/logger.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROMPT_PATH = path.resolve(__dirname, '..', '..', 'prompts', 'explainer-narration.v1.md');
 
-const WORDS_PER_SECOND = 2.5;
-const BATCH_SIZE = 15;
+const WORDS_PER_SECOND = 2.3;
+const BATCH_SIZE = 12;
 
 async function getPrompt() {
   try { return await fs.readFile(PROMPT_PATH, 'utf-8'); }
-  catch { return 'Write narrator commentary. One segment per beat. Return JSON {title,hook,segments:[{beatIndex,text,mood}]}.'; }
+  catch { return 'Write narration. One segment per scene. Return JSON {title,hook,segments:[{sceneIndex,text,mood}]}.'; }
 }
 
 function extractJsonObject(text) {
@@ -37,14 +39,20 @@ function extractJsonObject(text) {
   return JSON.parse(raw);
 }
 
-function formatBeats(beats, wordBudgets) {
-  return beats.map(b => {
-    const dialogue = b.segments.map(s => `  [${s.start.toFixed(1)}s] ${s.text}`).join('\n');
-    const targetWords = wordBudgets?.[b.beatIndex] ?? Math.round(b.durationSec * WORDS_PER_SECOND);
+function formatScenes(scenes, wordBudgets) {
+  return scenes.map(s => {
+    const dur = s.endSec - s.startSec;
+    const targetWords = wordBudgets?.[s.idx] ?? Math.round(dur * WORDS_PER_SECOND);
+    const chars = s.characters?.length ? ` chars=[${s.characters.join(', ')}]` : '';
+    const dialogue = (s.dialogueGist || '').slice(0, 300);
+    const verbatim = (s.dialogueVerbatim || '').slice(0, 300);
     return (
-      `BEAT ${b.beatIndex} (episode ${b.episodeIdx}, ${b.startSec.toFixed(1)}-${b.endSec.toFixed(1)}s, ` +
-      `${b.durationSec.toFixed(1)}s, target ~${targetWords} words):\n${dialogue || '  (no dialogue — visual-only beat)'}`
-    );
+      `SCENE ${s.idx} (${s.startSec.toFixed(1)}-${s.endSec.toFixed(1)}s, ${dur.toFixed(1)}s, ` +
+      `type=${s.type}, mood=${s.mood}, importance=${s.importance},${chars} target ~${targetWords} words)\n` +
+      `  VISUAL:   ${s.visualDescription || '(unspecified)'}\n` +
+      (dialogue ? `  SAYS:     ${dialogue}\n` : '') +
+      (verbatim ? `  VERBATIM: ${verbatim}\n` : '')
+    ).trimEnd();
   }).join('\n\n');
 }
 
@@ -56,65 +64,83 @@ function chunk(arr, size) {
 
 /**
  * @param {string} projectId
- * @param {object} bundleSummary       from storySummarizer.summarizeBundle
- * @param {Array<object>} beats        clusters from beatClusterer
+ * @param {Array<object>} scenes        selected scenes from sceneSelector
  * @param {Function} onProgress
  * @param {object} opts
- * @param {number} opts.targetReelSec  target video duration — used to budget words per beat
+ * @param {number} opts.targetReelSec   total target reel duration for word budgeting
+ * @param {object} opts.bundleHints     optional: { bundleTitle, characters, throughLines, endsOn }
+ *                                       derived from the scene plan, gives the writer cross-scene context
  */
-export async function writeExplainerScript(projectId, bundleSummary, beats, onProgress = () => {}, { targetReelSec } = {}) {
-  if (!beats.length) throw new Error('No beats to write narration for');
+export async function writeExplainerScript(projectId, scenes, onProgress = () => {}, { targetReelSec, bundleHints } = {}) {
+  if (!scenes.length) throw new Error('No scenes to write narration for');
   const promptTemplate = await getPrompt();
 
-  // Compute per-beat word budget proportional to target duration.
-  const totalBeatDur = beats.reduce((s, b) => s + b.durationSec, 0);
-  const effectiveTarget = targetReelSec || totalBeatDur;
+  // Per-scene word budget proportional to its share of total selected time.
+  const totalSceneDur = scenes.reduce((s, sc) => s + (sc.endSec - sc.startSec), 0);
+  const effectiveTarget = targetReelSec || totalSceneDur;
   const totalWords = Math.round(effectiveTarget * WORDS_PER_SECOND);
   const wordBudgets = {};
-  for (const b of beats) {
-    const share = b.durationSec / (totalBeatDur || 1);
-    wordBudgets[b.beatIndex] = Math.max(10, Math.round(share * totalWords));
+  for (const s of scenes) {
+    const dur = s.endSec - s.startSec;
+    const share = dur / (totalSceneDur || 1);
+    wordBudgets[s.idx] = Math.max(8, Math.round(share * totalWords));
   }
-  logger.info(`[explainerScriptWriter] targetReelSec=${effectiveTarget.toFixed(0)}, totalWords=${totalWords}, beats=${beats.length}`);
+  logger.info(
+    `[explainerScriptWriter] target=${effectiveTarget.toFixed(0)}s totalWords=${totalWords} scenes=${scenes.length}`
+  );
 
-  const batches = chunk(beats, BATCH_SIZE);
-  const allSegments = [];
-  let title = bundleSummary?.bundleTitle || 'Anime Recap';
-  let hook = '';
+  // Cross-scene context block. Derived from the scene plan (top characters,
+  // arc-spanning info) so the narrator doesn't reintroduce known faces every scene.
+  const charCounts = {};
+  for (const s of scenes) for (const c of (s.characters || [])) {
+    charCounts[c] = (charCounts[c] || 0) + 1;
+  }
+  const topChars = Object.entries(charCounts).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([c]) => c);
 
   const contextBlock =
-    `BUNDLE TITLE: ${bundleSummary?.bundleTitle || 'Unknown'}\n` +
-    `ARC SUMMARY: ${bundleSummary?.arcSummary || ''}\n` +
-    `CHARACTERS:\n${(bundleSummary?.characters || []).map(c => `- ${c.name}: ${c.role}`).join('\n')}\n` +
-    `THROUGH LINES: ${(bundleSummary?.throughLines || []).join('; ')}\n` +
-    `ENDS ON: ${bundleSummary?.endsOn || ''}`;
+    `BUNDLE TITLE: ${bundleHints?.bundleTitle || 'Anime Explainer'}\n` +
+    `RECURRING CHARACTERS: ${topChars.join(', ') || '(infer from scenes)'}\n` +
+    `ARC OVERVIEW: ${bundleHints?.arcOverview || '(infer from scenes in order)'}\n` +
+    `THROUGH LINES: ${(bundleHints?.throughLines || []).join('; ')}\n` +
+    `ENDS ON: ${bundleHints?.endsOn || ''}\n`;
+
+  const batches = chunk(scenes, BATCH_SIZE);
+  const allSegments = [];
+  let title = bundleHints?.bundleTitle || 'Anime Explainer';
+  let hook  = '';
 
   for (let b = 0; b < batches.length; b++) {
-    const batchBeats = batches[b];
+    const batchScenes = batches[b];
     onProgress(
-      `Writing narration for beats ${batchBeats[0].beatIndex}-${batchBeats[batchBeats.length - 1].beatIndex} ` +
+      `Writing narration for scenes ${batchScenes[0].idx}-${batchScenes[batchScenes.length - 1].idx} ` +
       `(${b + 1}/${batches.length})`,
       Math.round((b / batches.length) * 95)
     );
 
     const isFirst = b === 0;
+    const hookInstruction = isFirst
+      ? `Write the hook + segments for this batch.`
+      : `This is batch ${b + 1} of ${batches.length} — DO NOT write a hook (leave hook empty).`;
+
     const prompt =
-      `${promptTemplate}\n\n${contextBlock}\n\n` +
-      (isFirst ? `Write the hook + segments for this batch.\n\n` : `This is batch ${b + 1} of ${batches.length} — DO NOT write a hook for this batch (leave hook empty).\n\n`) +
-      `BEATS:\n${formatBeats(batchBeats, wordBudgets)}`;
+      `${promptTemplate}\n\n${contextBlock}\n${hookInstruction}\n\n` +
+      `SCENES:\n${formatScenes(batchScenes, wordBudgets)}`;
 
     let parsed;
     try {
-      const raw = await retry(() => textQuery(prompt, { temperature: 0.7 }), { maxAttempts: 2, label: `explainer-script-batch-${b + 1}` });
+      const raw = await retry(
+        () => textQuery(prompt, { temperature: 0.7 }),
+        { maxAttempts: 2, label: `explainer-script-batch-${b + 1}` }
+      );
       parsed = extractJsonObject(raw);
     } catch (err) {
-      logger.warn(`[explainerScriptWriter] batch ${b + 1} failed: ${err.message} — using dialogue fallback`);
+      logger.warn(`[explainerScriptWriter] batch ${b + 1} failed: ${err.message} — using visual-description fallback`);
       parsed = {
         title, hook: '',
-        segments: batchBeats.map(b => ({
-          beatIndex: b.beatIndex,
-          text: b.segments.map(s => s.text).join(' '),
-          mood: 'calm',
+        segments: batchScenes.map(s => ({
+          sceneIndex: s.idx,
+          text: s.visualDescription || s.dialogueGist || 'Continuing...',
+          mood: s.mood || 'calm',
         })),
       };
     }
@@ -123,28 +149,30 @@ export async function writeExplainerScript(projectId, bundleSummary, beats, onPr
       title = parsed.title || title;
       hook  = parsed.hook  || '';
     }
-    const byIdx = new Map((parsed.segments || []).map(s => [s.beatIndex, s]));
-    for (const beat of batchBeats) {
-      const s = byIdx.get(beat.beatIndex);
+
+    const byIdx = new Map((parsed.segments || []).map(s => [s.sceneIndex, s]));
+    for (const scene of batchScenes) {
+      const s = byIdx.get(scene.idx);
       allSegments.push({
-        beatIndex: beat.beatIndex,
-        episodeIdx: beat.episodeIdx,
-        sourceStart: beat.startSec,
-        sourceEnd: beat.endSec,
-        text: s?.text?.trim() || beat.segments.map(seg => seg.text).join(' '),
-        mood: (s?.mood || 'calm').toLowerCase(),
+        sceneIndex: scene.idx,
+        sourceStart: scene.startSec,
+        sourceEnd:   scene.endSec,
+        text: s?.text?.trim() || scene.visualDescription || scene.dialogueGist || '',
+        mood: (s?.mood || scene.mood || 'calm').toLowerCase(),
       });
     }
   }
 
-  // Normalize order + fill gaps.
-  allSegments.sort((a, b) => a.beatIndex - b.beatIndex);
+  allSegments.sort((a, b) => a.sceneIndex - b.sceneIndex);
   const script = {
     title,
     hook,
     segments: allSegments,
     projectType: 'video_explainer',
-    sourceWindow: { startSec: beats[0].startSec, endSec: beats[beats.length - 1].endSec },
+    sourceWindow: {
+      startSec: scenes[0].startSec,
+      endSec: scenes[scenes.length - 1].endSec,
+    },
   };
   await safeWriteJson(projectPath(projectId, 'script.json'), script);
   onProgress('Script generation complete', 100);
