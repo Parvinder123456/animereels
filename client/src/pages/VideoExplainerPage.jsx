@@ -50,6 +50,7 @@ export default function VideoExplainerPage() {
   const [engine, setEngine] = useState('edge');
   const [aspect, setAspect] = useState('16:9');
   const [forceRefresh, setForceRefresh] = useState(false);
+  const [skipWindowsText, setSkipWindowsText] = useState('');
   const fileInputRef = useRef(null);
   const [fileNames, setFileNames] = useState([]);
 
@@ -59,9 +60,27 @@ export default function VideoExplainerPage() {
     return () => clearInterval(t);
   }, [id]);
 
+  // Prefill skip-windows textarea from persisted project config once it loads.
+  useEffect(() => {
+    const saved = project?.config?.manualSkipWindows;
+    if (Array.isArray(saved) && saved.length && !skipWindowsText) {
+      setSkipWindowsText(saved.map(w => `${fmtTime(w.startSec)}-${fmtTime(w.endSec)}`).join('\n'));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.config?.manualSkipWindows]);
+
   async function reload() {
     try { setProject(await get(`/projects/${id}`)); }
     catch (e) { setError(e.message); }
+  }
+
+  function fmtTime(sec) {
+    sec = Math.max(0, Math.round(sec));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${m}:${String(s).padStart(2, '0')}`;
   }
 
   async function handleUpload(e) {
@@ -87,6 +106,7 @@ export default function VideoExplainerPage() {
         targetDurationSec: Math.max(60, Number(targetMinutes) * 60),
         language: 'en',
         force: forceRefresh,
+        manualSkipWindows: skipWindowsText.trim(),
       });
       await reload();
     } catch (e) { setError(e.message); }
@@ -188,6 +208,22 @@ export default function VideoExplainerPage() {
             {analyzeDone ? 'Re-run analysis' : 'Run analysis'}
           </button>
         </div>
+        <div style={styles.field}>
+          <label>Manual skip windows (one per line)</label>
+          <textarea
+            rows={4}
+            placeholder={`# Format: M:SS-M:SS or H:MM:SS-H:MM:SS or seconds\n0:00-1:30\n22:00-24:00`}
+            value={skipWindowsText}
+            onChange={e => setSkipWindowsText(e.target.value)}
+            style={{ width: '100%', fontFamily: 'monospace', fontSize: 12, lineHeight: 1.4 }}
+          />
+          <div style={styles.hint}>
+            Time ranges (in the stitched timeline) that should be cut from the output. Use this when
+            OP/ED auto-detection misses a cold open, mid-episode recap, or ED that doesn't sit at
+            the exact episode boundary. Merged with auto-detected OP/ED. Lines starting with <code>#</code> are ignored.
+          </div>
+        </div>
+
         <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-secondary)', cursor: 'pointer' }}>
           <input type="checkbox" checked={forceRefresh} onChange={e => setForceRefresh(e.target.checked)} />
           Force re-run from scratch (skip scene-plan + OP/ED cache — costs ~$0.90 in Gemini if free tier is exhausted)
@@ -195,6 +231,8 @@ export default function VideoExplainerPage() {
         <div style={styles.hint}>
           By default, re-running with the same source skips the Gemini multimodal breakdown
           (the most expensive step). Only the scene-selection + script-writer steps re-run.
+          Changing the skip windows above does NOT require force — they're applied dynamically
+          on top of the cached scene plan.
         </div>
         {analyzeDone && <div style={styles.progress}>✓ Script + scenes ready</div>}
       </div>

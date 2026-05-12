@@ -288,27 +288,42 @@ export async function breakDownVideo(projectId, sourcePath, totalSec, skipWindow
 
   try { await fsp.rmdir(tmpDir); } catch {}
 
-  // Filter out scenes overlapping skip windows (OP/ED).
-  const isInSkip = (sec) => skipWindows.some(w => sec >= w.startSec && sec < w.endSec);
-  const filteredScenes = allScenes
-    .filter(s => s.type !== 'intro_outro')
-    .filter(s => !isInSkip((s.startSec + s.endSec) / 2));
-
-  // Renumber after filtering.
-  filteredScenes.forEach((s, i) => { s.idx = i; });
+  // Only drop intrinsically-intro_outro scenes here — skip-window filtering is
+  // applied DYNAMICALLY by the caller, so manual skip windows can be added
+  // later without invalidating the (expensive) cached breakdown.
+  const sceneRaw = allScenes.filter(s => s.type !== 'intro_outro');
+  sceneRaw.forEach((s, i) => { s.idx = i; });
 
   const plan = {
     totalSec,
     chunkCount: chunks.length,
     rawSceneCount: allScenes.length,
-    sceneCount: filteredScenes.length,
-    scenes: filteredScenes,
+    sceneCount: sceneRaw.length,
+    scenes: sceneRaw,
     sourceIdentity: await sourceIdentity(sourcePath).catch(() => null),
     cachedAt: new Date().toISOString(),
   };
   await safeWriteJson(projectPath(projectId, 'scene-plan.json'), plan);
 
-  onProgress(`Visual breakdown complete: ${filteredScenes.length} scenes`, 100);
-  logger.info(`[geminiVideoBreakdown] kept ${filteredScenes.length}/${allScenes.length} scenes after skip filter`);
+  onProgress(`Visual breakdown complete: ${sceneRaw.length} scenes`, 100);
+  logger.info(`[geminiVideoBreakdown] kept ${sceneRaw.length}/${allScenes.length} scenes after type filter (skip-window filter is dynamic)`);
   return plan;
+}
+
+// ─── Skip-window filter (applied after cache load too) ───────────────────────
+
+/**
+ * Drop scenes whose midpoint falls inside any skip window, then renumber.
+ * Pure, idempotent — safe to apply to a cached plan with a different set of
+ * skip windows than the breakdown was originally produced with.
+ */
+export function applySkipWindows(scenes, skipWindows) {
+  if (!skipWindows?.length) {
+    scenes.forEach((s, i) => { s.idx = i; });
+    return scenes;
+  }
+  const isInSkip = (sec) => skipWindows.some(w => sec >= w.startSec && sec < w.endSec);
+  const filtered = scenes.filter(s => !isInSkip((s.startSec + s.endSec) / 2));
+  filtered.forEach((s, i) => { s.idx = i; });
+  return filtered;
 }

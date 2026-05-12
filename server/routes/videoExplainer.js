@@ -30,7 +30,7 @@ import {
 import { runJob, emit, isRunning } from '../jobs/processor.js';
 import { stitchEpisodes } from '../services/videoStitcher.js';
 import { detectOpEd, mergeSkipWindows, loadCachedOpEd } from '../services/opEdDetector.js';
-import { breakDownVideo, loadCachedPlan } from '../services/geminiVideoBreakdown.js';
+import { breakDownVideo, loadCachedPlan, applySkipWindows } from '../services/geminiVideoBreakdown.js';
 import { selectScenes, pickMode } from '../services/sceneSelector.js';
 import {
   summarizeEpisodes, summarizeBundle,
@@ -56,6 +56,49 @@ function scenesToTranscriptLikeSegments(scenes) {
       s.dialogueVerbatim ? `[SAYS] ${s.dialogueVerbatim}` : '',
     ].filter(Boolean).join(' '),
   }));
+}
+
+/**
+ * Parse a user-supplied skip-windows string.
+ *
+ * Accepts an array of {startSec, endSec} numbers (already structured),
+ * OR a string with one window per line. Each line may be:
+ *   "30-90"              (seconds)
+ *   "0:30-1:30"          (M:SS)
+ *   "00:30-01:30"        (MM:SS)
+ *   "1:30:00-1:31:30"    (H:MM:SS)
+ * Lines starting with '#' or blank are ignored.
+ */
+function parseManualSkipWindows(input) {
+  if (Array.isArray(input)) {
+    return input
+      .map(w => ({ startSec: Number(w.startSec), endSec: Number(w.endSec) }))
+      .filter(w => Number.isFinite(w.startSec) && Number.isFinite(w.endSec) && w.endSec > w.startSec);
+  }
+  if (typeof input !== 'string') return [];
+
+  const toSec = (token) => {
+    const parts = token.trim().split(':').map(Number);
+    if (parts.some(p => !Number.isFinite(p))) return NaN;
+    if (parts.length === 1) return parts[0];
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    return NaN;
+  };
+
+  return input
+    .split(/\r?\n|,/)
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith('#'))
+    .map(l => {
+      const m = l.match(/^([\d:.]+)\s*[-–—]\s*([\d:.]+)$/);
+      if (!m) return null;
+      const startSec = toSec(m[1]);
+      const endSec   = toSec(m[2]);
+      if (!Number.isFinite(startSec) || !Number.isFinite(endSec) || endSec <= startSec) return null;
+      return { startSec, endSec };
+    })
+    .filter(Boolean);
 }
 
 const router = Router();
@@ -142,6 +185,12 @@ router.post('/:id/explainer/run', validateProject, async (req, res, next) => {
     const targetDurationSec = Math.max(60, Number(req.body?.targetDurationSec) || 60 * 60);
     const language = (req.body?.language || 'en').trim();
     const force = req.body?.force === true || req.body?.force === 'true';
+    const manualSkipWindows = parseManualSkipWindows(req.body?.manualSkipWindows);
+
+    // Persist the user's manual skips so the UI can prefill on next visit.
+    project.config = project.config || {};
+    project.config.manualSkipWindows = manualSkipWindows;
+    await safeWriteJson(projectPath(req.params.id, 'project.json'), project);
 
     runJob(req.params.id, async () => {
       let currentStep = 'panels';
@@ -178,7 +227,14 @@ router.post('/:id/explainer/run', validateProject, async (req, res, next) => {
             onStep('panels')(msg, 2 + Math.round(pct * 0.08))
           ));
         }
-        const skipWindows = mergeSkipWindows(opCuts, edCuts);
+        // Merge auto-detected OP/ED + user-supplied manual windows.
+        const skipWindows = mergeSkipWindows([...opCuts, ...manualSkipWindows], edCuts);
+        if (manualSkipWindows.length) {
+          logger.info(
+            `[videoExplainer] manual skip windows: ${manualSkipWindows.length} ` +
+            `(${manualSkipWindows.map(w => `${w.startSec.toFixed(1)}-${w.endSec.toFixed(1)}`).join(', ')})`
+          );
+        }
 
         // 2. Gemini multimodal visual+audio breakdown. CACHED: scene-plan.json
         // is keyed on the source file's identity (size + mtime). Re-runs with
@@ -200,6 +256,14 @@ router.post('/:id/explainer/run', validateProject, async (req, res, next) => {
           );
         }
         if (!plan.scenes?.length) throw new Error('Scene breakdown returned zero scenes — source unreadable?');
+
+        // Apply skip-window filter dynamically. This lets manual skip windows
+        // take effect even when the scene-plan is a cache hit (the breakdown
+        // itself doesn't filter by skip windows anymore — see geminiVideoBreakdown.js).
+        const filteredScenes = applySkipWindows(plan.scenes, skipWindows);
+        if (!filteredScenes.length) throw new Error('All scenes were inside skip windows — check manual skip windows');
+        logger.info(`[videoExplainer] after skip-window filter: ${filteredScenes.length}/${plan.scenes.length} scenes kept`);
+        plan = { ...plan, scenes: filteredScenes };
 
         // 3. Story summarization (RESTORED — this is what makes the narrator
         // sound good). Per-episode summaries → bundle summary. We feed each
