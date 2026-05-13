@@ -5,10 +5,10 @@
  *   - Cover the full arc of the source (story-arc coverage: pick from every
  *     third of the timeline)
  *   - Bias toward importance >= 3
- *   - Prefer scene types that carry the story (action, reveal, emotional)
- *     over transitions and recap montages
- *   - Avoid back-to-back scenes from identical importance/type unless the
- *     story demands it
+ *   - Prefer scene types that carry the story (insight, action, reveal, emotional)
+ *     over transitions and intro/outro
+ *   - Preserve setup-payoff pairs: if a scene references an earlier one via
+ *     callbackTo, both are kept or neither
  *
  * Modes:
  *   - cut         (ratio > 3.5): pick a sparse subset
@@ -19,13 +19,17 @@
 import { logger } from '../utils/logger.js';
 
 const TYPE_SCORES = {
-  action: 1.0,
-  reveal: 1.0,
-  emotional: 0.9,
-  dialogue: 0.7,
-  exposition: 0.6,
-  transition: 0.2,
-  intro_outro: 0.0,
+  insight:      1.0,
+  action:       1.0,
+  reveal:       1.0,
+  story:        0.9,
+  emotional:    0.9,
+  explanation:  0.8,
+  debate:       0.8,
+  dialogue:     0.7,
+  exposition:   0.6,
+  transition:   0.2,
+  intro_outro:  0.0,
 };
 
 export function pickMode(sourceSec, targetSec) {
@@ -42,7 +46,49 @@ function scoreScene(scene) {
   const typeScore = TYPE_SCORES[scene.type] ?? 0.5;
   const importanceScore = (scene.importance ?? 3) / 5;
   const hasDialogue = scene.dialogueGist?.length > 0 ? 0.15 : 0;
-  return typeScore * 0.5 + importanceScore * 0.5 + hasDialogue;
+  const hasTakeaway = scene.keyTakeaway?.length > 0 ? 0.2 : 0;
+  return typeScore * 0.4 + importanceScore * 0.4 + hasDialogue + hasTakeaway;
+}
+
+/**
+ * Ensure setup-payoff pairs are kept together. If a selected scene
+ * has callbackTo referencing an unselected scene, add it.
+ */
+function reindexWithCallbacks(scenes) {
+  const oldToNew = new Map();
+  scenes.forEach((s, i) => {
+    oldToNew.set(s.idx, i);
+    s.idx = i;
+  });
+  for (const s of scenes) {
+    if (s.callbackTo != null) {
+      s.callbackTo = oldToNew.has(s.callbackTo) ? oldToNew.get(s.callbackTo) : null;
+    }
+  }
+}
+
+function resolveCallbacks(selected, allScenes) {
+  const selectedIdxs = new Set(selected.map(s => s.idx));
+  const allByIdx = new Map(allScenes.map(s => [s.idx, s]));
+  const toAdd = [];
+
+  for (const s of selected) {
+    if (s.callbackTo != null && !selectedIdxs.has(s.callbackTo)) {
+      const ref = allByIdx.get(s.callbackTo);
+      if (ref) {
+        toAdd.push({ ...ref });
+        selectedIdxs.add(ref.idx);
+      }
+    }
+  }
+
+  if (toAdd.length > 0) {
+    const combined = [...selected, ...toAdd].sort((a, b) => a.startSec - b.startSec);
+    reindexWithCallbacks(combined);
+    logger.info(`[sceneSelector] callbackTo: added ${toAdd.length} referenced scene(s) for setup-payoff`);
+    return combined;
+  }
+  return selected;
 }
 
 /**
@@ -67,8 +113,9 @@ export function selectScenes(scenes, targetSec, mode) {
       keep.add(s.idx);
       usedSec += (s.endSec - s.startSec);
     }
-    const out = scenes.filter(s => keep.has(s.idx));
-    out.forEach((s, i) => { s.idx = i; });
+    let out = scenes.filter(s => keep.has(s.idx));
+    out = resolveCallbacks(out, scenes);
+    reindexWithCallbacks(out);
     logger.info(`[sceneSelector] continuous: kept ${out.length}/${scenes.length} scenes (${usedSec.toFixed(1)}s)`);
     return out;
   }
@@ -104,12 +151,14 @@ export function selectScenes(scenes, targetSec, mode) {
   }
 
   picked.sort((a, b) => a.startSec - b.startSec);
-  picked.forEach((s, i) => { s.idx = i; });
-  logger.info(
-    `[sceneSelector] ${mode}: kept ${picked.length}/${scenes.length} scenes (${usedSec.toFixed(1)}s / target ${targetSec}s)`
-  );
-  return picked.map(s => {
+  let result = picked.map(s => {
     const { _score, ...rest } = s;
     return rest;
   });
+  result = resolveCallbacks(result, scenes);
+  reindexWithCallbacks(result);
+  logger.info(
+    `[sceneSelector] ${mode}: kept ${result.length}/${scenes.length} scenes (${usedSec.toFixed(1)}s / target ${targetSec}s)`
+  );
+  return result;
 }

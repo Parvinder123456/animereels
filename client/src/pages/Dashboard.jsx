@@ -3,11 +3,9 @@ import { useNavigate } from 'react-router-dom';
 import { get, post, patch, del } from '../api/client.js';
 
 const PROJECT_TYPES = [
-  { value: 'manga',         label: 'Manga / Manhwa',     subtitle: 'Upload chapter images.',                       icon: '\u{1F4D6}' },
-  { value: 'video_summary', label: 'Video Summary',      subtitle: 'Upload an anime episode → narrated recap.',    icon: '\u{1F3AC}' },
-  { value: 'translate',     label: 'YouTube Hindi → EN', subtitle: 'Paste a Hindi YouTube URL → English clip.',    icon: '\u{1F310}' },
+  { value: 'video_explainer', label: 'Video Explainer',    subtitle: 'YouTube URL or upload → AI narrated recap video.',     icon: '\u{1F3AC}' },
   { value: 'shorts',          label: 'YouTube Shorts',     subtitle: 'AI picks the best moments → vertical clips.',          icon: '\u{2702}\u{FE0F}' },
-  { value: 'video_explainer', label: 'Anime Explainer',    subtitle: 'Stitch multiple episodes → long narrated explainer.',  icon: '\u{1F4FA}' },
+  { value: 'translate',       label: 'YouTube Hindi → EN', subtitle: 'Paste a Hindi YouTube URL → English clip.',            icon: '\u{1F310}' },
 ];
 
 const styles = {
@@ -235,7 +233,7 @@ export default function Dashboard() {
   const [error, setError] = useState(null);
   const [showModal, setShowModal] = useState(false);
   const [newName, setNewName] = useState('');
-  const [newType, setNewType] = useState('manga');
+  const [newType, setNewType] = useState('video_explainer');
   const [newUrl, setNewUrl] = useState('');
   const [newTopic, setNewTopic] = useState('');
   const [newManual, setNewManual] = useState(false);
@@ -289,28 +287,11 @@ export default function Dashboard() {
         return;
       }
 
-      if (!newName.trim()) throw new Error('Project name is required');
-      const project = await post('/projects', { name: newName.trim() });
-
-      if (newType === 'video_summary') {
-        await patch(`/projects/${project.id}/config`, { projectType: 'video_summary' });
-        setShowModal(false);
-        resetModal();
-        navigate(`/projects/${project.id}/video`);
-        return;
-      }
-
-      if (newType === 'video_explainer') {
-        await patch(`/projects/${project.id}/config`, { projectType: 'video_explainer' });
-        setShowModal(false);
-        resetModal();
-        navigate(`/projects/${project.id}/explainer`);
-        return;
-      }
-
+      const project = await post('/projects', { name: (newName.trim() || 'Untitled Recap') });
+      await patch(`/projects/${project.id}/config`, { projectType: 'video_explainer' });
       setShowModal(false);
       resetModal();
-      navigate(`/projects/${project.id}`);
+      navigate(`/projects/${project.id}/explainer`);
     } catch (e) {
       setCreateError(e.message);
     } finally {
@@ -322,7 +303,7 @@ export default function Dashboard() {
     setNewName('');
     setNewUrl('');
     setNewTopic('');
-    setNewType('manga');
+    setNewType('video_explainer');
     setNewManual(false);
   }
 
@@ -338,20 +319,12 @@ export default function Dashboard() {
 
   function handleCardClick(project) {
     const type = project.config?.projectType;
-    if (project.state?.render === 'complete' && type !== 'shorts' && type !== 'translate') {
-      navigate(`/projects/${project.id}/detail`);
-      return;
-    }
-    if (type === 'video_summary') {
-      navigate(`/projects/${project.id}/video`);
-    } else if (type === 'translate') {
+    if (type === 'translate') {
       navigate(`/projects/${project.id}/translate`);
     } else if (type === 'shorts') {
       navigate(`/projects/${project.id}/shorts`);
-    } else if (type === 'video_explainer') {
-      navigate(`/projects/${project.id}/explainer`);
     } else {
-      navigate(`/projects/${project.id}`);
+      navigate(`/projects/${project.id}/explainer`);
     }
   }
 
@@ -386,7 +359,7 @@ export default function Dashboard() {
           <span style={styles.emptyIcon}>*</span>
           <div style={styles.emptyTitle}>No projects yet</div>
           <div style={styles.emptySubtitle}>
-            Create your first project to start turning manga chapters into animated reels.
+            Create your first project to generate AI-narrated recap videos from YouTube or uploaded content.
           </div>
           <button className="btn-primary" onClick={openModal}>
             Create Your First Project
@@ -438,12 +411,12 @@ export default function Dashboard() {
               </div>
             </div>
 
-            {newType !== 'translate' && newType !== 'shorts' && (
+            {newType === 'video_explainer' && (
               <div>
-                <label>Project Name</label>
+                <label>Project Name (optional — auto-filled from video title)</label>
                 <input
                   type="text"
-                  placeholder={newType === 'manga' ? 'e.g. One Piece Chapter 1050' : 'e.g. Naruto Episode 133 Recap'}
+                  placeholder="e.g. Huberman Lab Sleep Episode Recap"
                   value={newName}
                   onChange={e => setNewName(e.target.value)}
                   onKeyDown={handleModalKeyDown}
@@ -522,7 +495,7 @@ export default function Dashboard() {
               <button
                 className="btn-primary"
                 onClick={handleCreate}
-                disabled={creating || ((newType === 'translate' || newType === 'shorts') ? !newUrl.trim() : !newName.trim())}
+                disabled={creating || ((newType === 'translate' || newType === 'shorts') && !newUrl.trim())}
               >
                 {creating ? 'Creating...' : 'Create Project'}
               </button>

@@ -11,16 +11,33 @@ const MAX_CHUNK_CHARS = 3500;
 // Mood-based breathing room (seconds of silence injected between segments).
 // Prevents the "machine gun" narration effect — matches pro recap pacing.
 const MOOD_BREATHING_ROOM = {
-  action:    0.15,   // fast cuts — minimal pause
-  horror:    0.40,
-  suspense:  0.55,   // let tension hang
-  dramatic:  0.45,   // dramatic weight
-  reveal:    0.60,   // let reveals land
-  emotional: 0.55,   // emotional beats need air
-  calm:      0.35,
-  comedic:   0.25,
+  action:        0.15,   // fast cuts — minimal pause
+  energetic:     0.20,
+  horror:        0.40,
+  suspense:      0.55,   // let tension hang
+  dramatic:      0.45,   // dramatic weight
+  reveal:        0.60,   // let reveals land
+  emotional:     0.55,   // emotional beats need air
+  inspirational: 0.40,
+  calm:          0.35,
+  comedic:       0.25,
+  breathe:       0.30,   // after a breathe segment
 };
 const DEFAULT_BREATHING_ROOM = 0.35;
+
+// SSML prosody settings per mood — vary rate/pitch for natural delivery.
+// Edge TTS respects <prosody> tags inside the SSML voice element.
+const MOOD_PROSODY = {
+  energetic:     { rate: '+10%', pitch: '+3%' },
+  action:        { rate: '+12%', pitch: '+3%' },
+  inspirational: { rate: '+5%', pitch: '+2%' },
+  dramatic:      { rate: '-8%', pitch: '-5%' },
+  emotional:     { rate: '-10%', pitch: '-3%' },
+  suspense:      { rate: '-8%', pitch: '-8%' },
+  reveal:        { rate: '-5%' },
+  comedic:       { rate: '+5%' },
+  calm:          {},
+};
 
 export const EDGE_VOICES = [
   { id: 'en-US-GuyNeural',         label: 'Guy — Deep Male Narrator' },
@@ -32,6 +49,18 @@ export const EDGE_VOICES = [
   { id: 'en-US-SaraNeural',        label: 'Sara — Smooth Female' },
   { id: 'en-US-TonyNeural',        label: 'Tony — Casual Male' },
 ];
+
+/**
+ * Wrap text in SSML prosody tags based on mood.
+ * Edge TTS accepts inline SSML elements within the voice wrapper.
+ */
+function wrapWithProsody(text, mood) {
+  const settings = MOOD_PROSODY[mood] || {};
+  const keys = Object.keys(settings);
+  if (!keys.length) return text;
+  const attrs = keys.map(k => `${k}="${settings[k]}"`).join(' ');
+  return `<prosody ${attrs}>${text}</prosody>`;
+}
 
 /**
  * Collect a Readable stream into a single Buffer.
@@ -249,18 +278,47 @@ export async function generateNarration(projectId, voiceName, onProgress = () =>
   for (let i = 0; i < segments.length; i++) {
     const segment = segments[i];
     const segText = (segment.text || '').trim();
+    const moodKey = (segment.mood || '').toLowerCase();
+    const isBreathe = !segText || moodKey === 'breathe';
     const pct = 20 + Math.round((i / segments.length) * 55);
-    logger.info(`[edgeTTS generateNarration] === Segment ${i + 1}/${segments.length} — ${segText.length} chars, mood: ${segment.mood || 'unknown'} ===`);
+    logger.info(`[edgeTTS generateNarration] === Segment ${i + 1}/${segments.length} — ${segText.length} chars, mood: ${moodKey || 'unknown'}${isBreathe ? ' (BREATHE)' : ''} ===`);
     onProgress(`Generating narration for segment ${i + 1}/${segments.length}...`, pct);
 
-    if (!segText) {
-      logger.warn(`[edgeTTS generateNarration] Segment ${i + 1} is empty, skipping`);
-      segmentBoundaries.push({ segmentIndex: i, startTime: +globalTimeOffset.toFixed(3), endTime: +globalTimeOffset.toFixed(3), wordCount: 0, text: '' });
+    // Breathe segment: inject silence so original audio plays through
+    if (isBreathe) {
+      const breatheDur = Math.min(15, Math.max(2, (segment.sourceEnd - segment.sourceStart) || 3));
+      const silencePath = path.join(audioDir, `breathe-seg${i}.mp3`);
+      generateSilenceFile(breatheDur, silencePath);
+      allAudioFiles.push(silencePath);
+
+      const segStartTime = globalTimeOffset;
+      globalTimeOffset += breatheDur;
+
+      segmentBoundaries.push({
+        segmentIndex: i,
+        startTime: +segStartTime.toFixed(3),
+        endTime: +globalTimeOffset.toFixed(3),
+        wordCount: 0,
+        text: '(breathe)',
+      });
+      logger.info(`[edgeTTS] Breathe segment ${i + 1}: ${breatheDur.toFixed(1)}s silence (source: ${segment.sourceStart?.toFixed(1)}-${segment.sourceEnd?.toFixed(1)}s)`);
+
+      // Breathing room after breathe segments
+      if (i < segments.length - 1) {
+        const pauseDuration = MOOD_BREATHING_ROOM.breathe;
+        const gapPath = path.join(audioDir, `silence-seg${i}.mp3`);
+        generateSilenceFile(pauseDuration, gapPath);
+        allAudioFiles.push(gapPath);
+        globalTimeOffset += pauseDuration;
+      }
       continue;
     }
 
     const segStartTime = globalTimeOffset;
-    const chunks = splitTextIntoChunks(segText);
+
+    // Apply SSML prosody based on mood
+    const prosodyText = wrapWithProsody(segText, moodKey);
+    const chunks = splitTextIntoChunks(prosodyText);
     logger.info(`[edgeTTS generateNarration] Segment ${i + 1} split into ${chunks.length} chunk(s)`);
     let segWordCount = 0;
 
@@ -303,7 +361,6 @@ export async function generateNarration(projectId, voiceName, onProgress = () =>
 
     // Breathing room: inject silence between segments for natural pacing
     if (i < segments.length - 1) {
-      const moodKey = (segment.mood || '').toLowerCase();
       const pauseDuration = MOOD_BREATHING_ROOM[moodKey] || DEFAULT_BREATHING_ROOM;
       const silencePath = path.join(audioDir, `silence-seg${i}.mp3`);
       generateSilenceFile(pauseDuration, silencePath);

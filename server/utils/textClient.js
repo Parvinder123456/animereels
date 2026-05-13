@@ -120,7 +120,7 @@ async function geminiText(prompt, s, { temperature }) {
   const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({
     model: s.geminiModel,
-    generationConfig: { temperature },
+    generationConfig: { temperature, thinkingConfig: { thinkingBudget: 4096 } },
     safetySettings: GEMINI_SAFETY_OFF,
   });
   const result = await withTimeout(

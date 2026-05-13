@@ -1,28 +1,36 @@
-You will receive the dialogue transcript of one anime episode, with timestamps.
+You will receive the transcript of a content segment (podcast, interview,
+lecture, or video), with timestamps.
 
-Produce a tight summary that captures the story so the narrator who will
-later write commentary KNOWS what is happening, who matters, and why.
+Produce a tight summary that captures the key insights so the narrator who
+will later write commentary KNOWS what was said, who said it, and why it
+matters.
 
 Return ONLY this JSON — no prose, no code fence:
 
 {
   "episodeIdx":  <integer>,
-  "title":       "<a short episode title you can infer from the dialogue, e.g. 'The Sword's Awakening'>",
+  "title":       "<a short descriptive title, e.g. 'The Morning Sunlight Protocol'>",
   "characters":  [
-    { "name": "<name or role>", "role": "<one-line who they are and what they want>" }
+    { "name": "<speaker name or role>", "role": "<who they are and their expertise>" }
   ],
-  "plotArc":     "<3-5 sentence description of what happens in this episode from start to end>",
+  "plotArc":     "<3-5 sentences: what's discussed from start to finish, and the key thesis>",
   "keyMoments":  [
-    { "atSec": <number>, "what": "<one-line: what happens here that matters>" }
+    { "atSec": <number>, "what": "<one-line: actionable insight, powerful quote, or key revelation>" }
   ],
   "themes":      ["<theme1>", "<theme2>"],
-  "unresolved":  "<one sentence: what's set up to pay off later>"
+  "unresolved":  "<one sentence: what question is left open or what's set up for later>"
 }
 
 RULES:
-- Be specific about WHAT happens, not vague. "Hero meets a stranger" is bad;
-  "Tanjiro encounters the demon slayer Giyu, who challenges him to prove his
-   resolve" is good.
-- Names matter. Use them if the dialogue gives them, otherwise label by role.
+- Be specific about WHAT was said. "They talk about health" is bad;
+  "Huberman explains that 10 minutes of morning sunlight within 30 min of
+   waking triggers melanopsin cells to set circadian rhythm, improving sleep
+   onset by ~30 minutes" is good.
+- Names matter. Use speaker names from the transcript. If unknown, label
+  by role (Host, Guest, etc.).
 - 5-8 keyMoments, in chronological order, with absolute timestamps.
+- Focus on ACTIONABLE insights the narrator can turn into advice for the
+  viewer.
+- For narrative content: focus on what happens, who changes, and why it
+  matters to the story.
 - Output ONLY the JSON object.

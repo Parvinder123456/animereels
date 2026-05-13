@@ -51,11 +51,58 @@ async function loadPrompt() {
   catch { return 'Break the video into visually-anchored scenes. Return JSON {chunkStartSec, scenes:[...]}.'; }
 }
 
+function repairJson(raw) {
+  let s = raw;
+  // Remove trailing commas before } or ]
+  s = s.replace(/,\s*([}\]])/g, '$1');
+  // Try parsing as-is first
+  try { return JSON.parse(s); } catch {}
+
+  // Fix missing commas between } { or } " or ] { or ] " (common Gemini glitch)
+  s = s.replace(/\}(\s*)\{/g, '},$1{');
+  s = s.replace(/\}(\s*)"(?![,:\s}])/g, '},$1"');
+  s = s.replace(/\](\s*)\[/g, '],$1[');
+  s = s.replace(/\](\s*)\{/g, '],$1{');
+  // Fix missing comma after string/number value before next key: "key": "val"\n"key2"
+  s = s.replace(/"(\s*\n\s*)"(?=[a-zA-Z])/g, '",$1"');
+  // Remove trailing commas again after fixes
+  s = s.replace(/,\s*([}\]])/g, '$1');
+  try { return JSON.parse(s); } catch {}
+
+  // Truncated JSON — close open brackets/braces
+  let open = 0, arr = 0;
+  for (const ch of s) {
+    if (ch === '{') open++;
+    else if (ch === '}') open--;
+    else if (ch === '[') arr++;
+    else if (ch === ']') arr--;
+  }
+  // Trim trailing partial tokens (cut at last complete value)
+  s = s.replace(/,?\s*"[^"]*$/, '');    // partial string key/value
+  s = s.replace(/,?\s*\{[^}]*$/, '');   // partial object
+  s = s.replace(/,\s*$/, '');           // trailing comma
+  // Recount after trimming
+  open = 0; arr = 0;
+  for (const ch of s) {
+    if (ch === '{') open++;
+    else if (ch === '}') open--;
+    else if (ch === '[') arr++;
+    else if (ch === ']') arr--;
+  }
+  s += ']'.repeat(Math.max(0, arr)) + '}'.repeat(Math.max(0, open));
+  return JSON.parse(s);
+}
+
 function extractJsonObject(text) {
   const fence = text.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
   const raw = fence ? fence[1] : (text.match(/\{[\s\S]*\}/)?.[0]);
   if (!raw) throw new Error('No JSON object in Gemini scene-breakdown response');
-  return JSON.parse(raw);
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    logger.warn(`[geminiVideoBreakdown] JSON parse failed, attempting repair: ${e.message}`);
+    return repairJson(raw);
+  }
 }
 
 function planChunks(totalSec) {
@@ -72,16 +119,18 @@ function planChunks(totalSec) {
 function extractChunkVideo(srcPath, startSec, durationSec, outPath) {
   // Keep both video + audio; Gemini multimodal needs both. Re-encode lightly
   // to a downsized stream so the Files API upload stays sub-GB even for
-  // long anime — Gemini is happy with low spatial resolution (it samples at
-  // ~1 fps anyway for video understanding).
+  // long content — Gemini is happy with low spatial resolution.
+  // -accurate_seek is default in modern ffmpeg but we set it explicitly
+  // to guarantee frame-accurate seeking even on older builds.
   return new Promise((resolve, reject) => {
     ffmpeg(srcPath)
       .setFfmpegPath(getFfmpegPath())
+      .inputOptions(['-accurate_seek'])
       .seekInput(startSec)
       .duration(durationSec)
       .outputOptions([
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28',
-        '-vf', 'scale=640:-2,fps=2',  // small + 2 fps is plenty for scene understanding
+        '-vf', 'scale=960:-2,fps=4',  // 960px + 4fps for richer visual understanding
         '-c:a', 'aac', '-b:a', '64k', '-ac', '1', '-ar', '16000',
         '-movflags', '+faststart',
       ])
@@ -158,15 +207,27 @@ async function analyzeChunk(model, fileInfo, chunkStartSec, chunkDurSec, promptT
       promptTemplate + '\n\n' + metaBlock,
       { fileData: { mimeType: fileInfo.mimeType, fileUri: fileInfo.uri } },
     ]),
-    { maxAttempts: 2, label: `breakdown-chunk-at-${chunkStartSec}s` }
+    { maxAttempts: 3, label: `breakdown-chunk-at-${chunkStartSec}s` }
   );
 
-  return extractJsonObject(result.response.text());
+  const rawText = result.response.text();
+  try {
+    return extractJsonObject(rawText);
+  } catch (err) {
+    // Dump first/last 500 chars so we can debug what Gemini returned
+    const preview = rawText.length > 1200
+      ? rawText.slice(0, 500) + '\n...\n' + rawText.slice(-500)
+      : rawText;
+    logger.error(`[geminiVideoBreakdown] unparseable response for chunk @${chunkStartSec}s:\n${preview}`);
+    throw err;
+  }
 }
 
-function normalizeScene(s, chunkStartSec, fallbackIdx) {
-  const relStart = Math.max(0, Number(s.startSec) || 0);
-  const relEnd   = Math.max(relStart + MIN_SCENE_SEC, Number(s.endSec) || (relStart + MIN_SCENE_SEC));
+function normalizeScene(s, chunkStartSec, chunkDurSec, fallbackIdx) {
+  // Clamp relative timestamps to the actual chunk duration — Gemini sometimes
+  // hallucinates timestamps beyond the chunk (especially for shorter last chunks).
+  const relStart = Math.max(0, Math.min(Number(s.startSec) || 0, chunkDurSec));
+  const relEnd   = Math.max(relStart + MIN_SCENE_SEC, Math.min(Number(s.endSec) || (relStart + MIN_SCENE_SEC), chunkDurSec));
   return {
     idx: fallbackIdx,
     startSec: relStart + chunkStartSec,
@@ -178,6 +239,8 @@ function normalizeScene(s, chunkStartSec, fallbackIdx) {
     dialogueGist: String(s.dialogueGist || '').trim(),
     dialogueVerbatim: String(s.dialogueVerbatim || '').trim(),
     characters: Array.isArray(s.characters) ? s.characters.map(String) : [],
+    keyTakeaway: String(s.keyTakeaway || '').trim(),
+    callbackTo: s.callbackTo != null ? Number(s.callbackTo) : null,
   };
 }
 
@@ -185,6 +248,77 @@ function clampInt(v, lo, hi, fallback) {
   const n = Math.round(Number(v));
   if (!Number.isFinite(n)) return fallback;
   return Math.max(lo, Math.min(hi, n));
+}
+
+/**
+ * Detect when Gemini returned absolute timestamps (relative to the full source)
+ * instead of chunk-relative timestamps. When > 50% of scenes have raw startSec
+ * values in the [chunkStart, chunkStart+chunkDur] range and chunkStart > 60s,
+ * it's almost certainly absolute. Convert by subtracting chunkStartSec.
+ *
+ * Must run BEFORE normalizeScene (on raw Gemini output).
+ */
+function detectAbsoluteTimestamps(rawScenes, chunkStartSec, chunkDurSec) {
+  if (rawScenes.length < 2 || chunkStartSec < 60) return rawScenes;
+
+  const chunkEnd = chunkStartSec + chunkDurSec;
+  const absoluteCount = rawScenes.filter(s => {
+    const t = Number(s.startSec) || 0;
+    return t >= chunkStartSec * 0.8 && t <= chunkEnd + 30;
+  }).length;
+
+  if (absoluteCount < rawScenes.length * 0.5) return rawScenes;
+
+  logger.warn(
+    `[geminiVideoBreakdown] ABSOLUTE TIMESTAMPS detected: ${absoluteCount}/${rawScenes.length} ` +
+    `scenes have startSec in [${chunkStartSec}, ${chunkEnd}] — converting to chunk-relative`
+  );
+  for (const s of rawScenes) {
+    const rawStart = Number(s.startSec) || 0;
+    const rawEnd = Number(s.endSec) || rawStart;
+    s.startSec = Math.max(0, rawStart - chunkStartSec);
+    s.endSec = Math.max(s.startSec + MIN_SCENE_SEC, rawEnd - chunkStartSec);
+  }
+  return rawScenes;
+}
+
+/**
+ * Detect degenerate timestamps (many scenes piled on the same start/end,
+ * typically caused by JSON repair stripping timestamp fields or absolute
+ * timestamps getting clamped to chunkDurSec).
+ *
+ * When this fires, scene timestamps have NO relationship to actual content —
+ * the narrator will describe the wrong visual. Redistribution is a last resort
+ * that logs at ERROR level so it's impossible to miss.
+ */
+function fixDegenerateTimestamps(scenes, chunkStartSec, chunkDurSec) {
+  if (scenes.length < 4) return scenes;
+
+  // Count how many scenes share the exact same startSec
+  const startCounts = {};
+  for (const s of scenes) {
+    const key = s.startSec.toFixed(1);
+    startCounts[key] = (startCounts[key] || 0) + 1;
+  }
+  const maxPile = Math.max(...Object.values(startCounts));
+  const threshold = Math.max(4, Math.ceil(scenes.length * 0.3));
+
+  if (maxPile < threshold) return scenes; // timestamps look fine
+
+  logger.error(
+    `[geminiVideoBreakdown] DEGENERATE TIMESTAMPS: ${maxPile}/${scenes.length} scenes ` +
+    `share the same startSec in chunk ${chunkStartSec.toFixed(0)}s–${(chunkStartSec + chunkDurSec).toFixed(0)}s. ` +
+    `Scene timestamps are UNRELIABLE for this chunk — redistributing evenly as last resort. ` +
+    `Check if Gemini is ignoring the chunk-relative instruction.`
+  );
+
+  const slotDur = chunkDurSec / scenes.length;
+  for (let i = 0; i < scenes.length; i++) {
+    scenes[i].startSec = chunkStartSec + i * slotDur;
+    scenes[i].endSec   = chunkStartSec + (i + 1) * slotDur;
+    scenes[i]._redistributed = true;
+  }
+  return scenes;
 }
 
 // ─── Source-identity cache ───────────────────────────────────────────────────
@@ -235,7 +369,7 @@ export async function breakDownVideo(projectId, sourcePath, totalSec, skipWindow
   const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({
     model: settings.geminiModel,
-    generationConfig: { temperature: 0.2, responseMimeType: 'application/json' },
+    generationConfig: { temperature: 0.2, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 8192 } },
   });
 
   const promptTemplate = await loadPrompt();
@@ -276,9 +410,23 @@ export async function breakDownVideo(projectId, sourcePath, totalSec, skipWindow
     await deleteFromFiles(apiKey, fileInfo.name);
     try { await fsp.unlink(chunkPath); } catch {}
 
-    const scenes = (parsed.scenes || [])
-      .map(s => normalizeScene(s, startSec, sceneIdx++))
+    // Detect absolute timestamps before normalization (which clamps to chunkDur)
+    let rawScenes = parsed.scenes || [];
+    rawScenes = detectAbsoluteTimestamps(rawScenes, startSec, durationSec);
+
+    const chunkFirstIdx = sceneIdx;
+    let scenes = rawScenes
+      .map(s => normalizeScene(s, startSec, durationSec, sceneIdx++))
       .filter(s => s.endSec - s.startSec >= MIN_SCENE_SEC);
+
+    // Convert callbackTo from chunk-local array index to global scene idx
+    for (const s of scenes) {
+      if (s.callbackTo != null) {
+        s.callbackTo = chunkFirstIdx + s.callbackTo;
+      }
+    }
+
+    scenes = fixDegenerateTimestamps(scenes, startSec, durationSec);
     allScenes.push(...scenes);
     logger.info(`[geminiVideoBreakdown] chunk ${i + 1}/${chunks.length}: ${scenes.length} scenes`);
 
@@ -292,7 +440,7 @@ export async function breakDownVideo(projectId, sourcePath, totalSec, skipWindow
   // applied DYNAMICALLY by the caller, so manual skip windows can be added
   // later without invalidating the (expensive) cached breakdown.
   const sceneRaw = allScenes.filter(s => s.type !== 'intro_outro');
-  sceneRaw.forEach((s, i) => { s.idx = i; });
+  reindexScenes(sceneRaw);
 
   const plan = {
     totalSec,
@@ -313,17 +461,33 @@ export async function breakDownVideo(projectId, sourcePath, totalSec, skipWindow
 // ─── Skip-window filter (applied after cache load too) ───────────────────────
 
 /**
+ * Re-index scenes and remap callbackTo references to the new indices.
+ * Without this, callbackTo breaks every time scenes are filtered/reordered.
+ */
+function reindexScenes(scenes) {
+  const oldToNew = new Map();
+  scenes.forEach((s, i) => {
+    oldToNew.set(s.idx, i);
+    s.idx = i;
+  });
+  for (const s of scenes) {
+    if (s.callbackTo != null) {
+      s.callbackTo = oldToNew.has(s.callbackTo) ? oldToNew.get(s.callbackTo) : null;
+    }
+  }
+  return scenes;
+}
+
+/**
  * Drop scenes whose midpoint falls inside any skip window, then renumber.
  * Pure, idempotent — safe to apply to a cached plan with a different set of
  * skip windows than the breakdown was originally produced with.
  */
 export function applySkipWindows(scenes, skipWindows) {
   if (!skipWindows?.length) {
-    scenes.forEach((s, i) => { s.idx = i; });
-    return scenes;
+    return reindexScenes(scenes);
   }
   const isInSkip = (sec) => skipWindows.some(w => sec >= w.startSec && sec < w.endSec);
   const filtered = scenes.filter(s => !isInSkip((s.startSec + s.endSec) / 2));
-  filtered.forEach((s, i) => { s.idx = i; });
-  return filtered;
+  return reindexScenes(filtered);
 }

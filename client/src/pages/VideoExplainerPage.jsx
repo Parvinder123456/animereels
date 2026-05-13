@@ -1,396 +1,403 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams } from 'react-router-dom';
 import { get, post } from '../api/client.js';
 import { useSSE } from '../hooks/useSSE.js';
 
-const styles = {
-  page: { display: 'flex', flexDirection: 'column', gap: 24 },
-  title: { fontSize: 24, fontWeight: 700, letterSpacing: '-0.5px' },
-  card: {
-    background: 'var(--bg-secondary)',
-    border: '1px solid var(--glass-border)',
-    borderRadius: 12,
-    padding: 24,
-    display: 'flex', flexDirection: 'column', gap: 12,
-  },
-  step: { fontSize: 12, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' },
-  progress: { fontSize: 13, color: 'var(--text-secondary)' },
-  bar: { height: 6, borderRadius: 999, background: 'var(--glass-border)', overflow: 'hidden' },
-  barFill: { height: '100%', background: 'var(--accent-purple)', transition: 'width 0.3s' },
-  row: { display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' },
-  field: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minWidth: 200 },
-  errorBanner: {
-    padding: '12px 16px', background: 'rgba(239,68,68,0.10)',
-    border: '1px solid rgba(239,68,68,0.30)', borderRadius: 8,
-    color: 'var(--error)', fontSize: 13,
-  },
-  hint: { fontSize: 12, color: 'var(--text-muted)' },
-};
+/* ── Voices & aspect options ─────────────────────────────────────── */
 
 const VOICES = [
-  { id: 'en-US-GuyNeural',         label: 'Guy — Deep Male Narrator' },
+  { id: 'en-US-GuyNeural',         label: 'Guy — Deep Male' },
   { id: 'en-US-ChristopherNeural', label: 'Christopher — Authoritative' },
+  { id: 'en-US-DavisNeural',       label: 'Davis — Warm Male' },
   { id: 'en-US-AriaNeural',        label: 'Aria — Versatile Female' },
+  { id: 'en-US-JennyNeural',       label: 'Jenny — Friendly Female' },
+  { id: 'en-GB-RyanNeural',        label: 'Ryan — British Male' },
+  { id: 'en-AU-WilliamNeural',     label: 'William — Australian Male' },
+  { id: 'en-IN-PrabhatNeural',     label: 'Prabhat — Indian Male' },
 ];
 
 const ASPECTS = [
-  { id: '16:9', label: '16:9 — YouTube long-form' },
-  { id: '9:16', label: '9:16 — Vertical / Shorts' },
-  { id: '1:1',  label: '1:1 — Square' },
+  { id: '16:9', label: '16:9 Landscape' },
+  { id: '9:16', label: '9:16 Vertical' },
+  { id: '1:1',  label: '1:1 Square' },
 ];
+
+/* ── Styles ──────────────────────────────────────────────────────── */
+
+const s = {
+  page: { display: 'flex', flexDirection: 'column', gap: 20, maxWidth: 900, margin: '0 auto' },
+  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 },
+  title: { fontSize: 22, fontWeight: 700, letterSpacing: '-0.3px' },
+  meta: { fontSize: 12, color: 'var(--text-muted)', display: 'flex', gap: 12, flexWrap: 'wrap' },
+  card: {
+    background: 'var(--bg-secondary)', border: '1px solid var(--glass-border)',
+    borderRadius: 10, padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 10,
+  },
+  stepLabel: {
+    fontSize: 11, fontWeight: 600, color: 'var(--accent-purple)',
+    textTransform: 'uppercase', letterSpacing: '0.6px',
+  },
+  row: { display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap' },
+  field: { display: 'flex', flexDirection: 'column', gap: 4, flex: 1, minWidth: 160 },
+  label: { fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)' },
+  hint: { fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.4 },
+  done: { fontSize: 13, color: 'var(--success)', fontWeight: 500 },
+  bar: { height: 5, borderRadius: 999, background: 'var(--glass-border)', overflow: 'hidden' },
+  barFill: { height: '100%', borderRadius: 999, background: 'var(--accent-purple)', transition: 'width 0.3s' },
+  err: {
+    padding: '10px 14px', background: 'rgba(239,68,68,0.08)',
+    border: '1px solid rgba(239,68,68,0.25)', borderRadius: 8,
+    color: 'var(--error)', fontSize: 12,
+  },
+  connDot: (on) => ({
+    width: 7, height: 7, borderRadius: '50%', flexShrink: 0,
+    background: on ? 'var(--success)' : 'var(--error)',
+    boxShadow: on ? '0 0 6px var(--success)' : 'none',
+  }),
+  divider: { display: 'flex', alignItems: 'center', gap: 10, margin: '4px 0' },
+  dividerLine: { flex: 1, height: 1, background: 'var(--glass-border)' },
+  dividerText: { fontSize: 11, color: 'var(--text-muted)' },
+};
+
+/* ── Component ───────────────────────────────────────────────────── */
 
 export default function VideoExplainerPage() {
   const { id } = useParams();
-  const progress = useSSE(id);
+  const { progress, connected, clearProgress } = useSSE(id);
+
   const [project, setProject] = useState(null);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+
+  // Source step
+  const [youtubeUrl, setYoutubeUrl] = useState('');
+  const fileInputRef = useRef(null);
+
+  // Analysis step
   const [targetMinutes, setTargetMinutes] = useState(60);
+  const [skipWindowsText, setSkipWindowsText] = useState('');
+  const [forceRefresh, setForceRefresh] = useState(false);
+
+  // Voice step
   const [voiceId, setVoiceId] = useState(VOICES[0].id);
   const [engine, setEngine] = useState('edge');
+
+  // Render step
   const [aspect, setAspect] = useState('16:9');
-  const [forceRefresh, setForceRefresh] = useState(false);
-  const [skipWindowsText, setSkipWindowsText] = useState('');
-  const fileInputRef = useRef(null);
-  const [fileNames, setFileNames] = useState([]);
+
+  // Preview
   const [preview, setPreview] = useState(null);
   const [previewOpen, setPreviewOpen] = useState(true);
   const [expandedScenes, setExpandedScenes] = useState(new Set());
 
-  useEffect(() => {
-    reload();
-    const t = setInterval(reload, 4000);
-    return () => clearInterval(t);
+  /* ── Data loading ───────────────────────────────────────────────── */
+
+  const reload = useCallback(async () => {
+    try { setProject(await get(`/projects/${id}`)); }
+    catch (e) { setError(e.message); }
   }, [id]);
 
-  // Prefill skip-windows textarea from persisted project config once it loads.
+  // Load project once on mount
+  useEffect(() => { reload(); }, [reload]);
+
+  // Reload project when a step completes (progress hits 100 or -1)
+  useEffect(() => {
+    if (progress && (progress.percent === 100 || progress.percent === -1)) {
+      reload();
+    }
+  }, [progress?.percent, progress?.step, reload]);
+
+  // Prefill skip windows from saved config
   useEffect(() => {
     const saved = project?.config?.manualSkipWindows;
     if (Array.isArray(saved) && saved.length && !skipWindowsText) {
       setSkipWindowsText(saved.map(w => `${fmtTime(w.startSec)}-${fmtTime(w.endSec)}`).join('\n'));
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project?.config?.manualSkipWindows]);
 
-  async function reload() {
-    try { setProject(await get(`/projects/${id}`)); }
-    catch (e) { setError(e.message); }
-  }
-
-  async function loadPreview() {
-    try { setPreview(await get(`/projects/${id}/explainer/preview`)); }
-    catch (e) { /* preview unavailable until analysis completes; ignore */ }
-  }
-
-  // Auto-load preview when analysis finishes (state.script flips to complete).
+  // Load preview when script is ready
   useEffect(() => {
-    if (project?.state?.script === 'complete') loadPreview();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project?.state?.script, project?.updatedAt]);
+    if (project?.state?.script === 'complete') {
+      get(`/projects/${id}/explainer/preview`).then(setPreview).catch(() => {});
+    }
+  }, [project?.state?.script, project?.updatedAt, id]);
 
-  function toggleScene(idx) {
-    setExpandedScenes(prev => {
-      const next = new Set(prev);
-      if (next.has(idx)) next.delete(idx); else next.add(idx);
-      return next;
-    });
-  }
-
-  async function regenerateScript() {
-    setError(null); setBusy(true);
-    try {
-      // force=false keeps scene-plan/bundle/op-ed caches; only selection + script re-run.
-      await post(`/projects/${id}/explainer/run`, {
-        targetDurationSec: Math.max(60, Number(targetMinutes) * 60),
-        language: 'en',
-        force: false,
-        manualSkipWindows: skipWindowsText.trim(),
-      });
-      await reload();
-    } catch (e) { setError(e.message); }
-    finally { setBusy(false); }
-  }
+  /* ── Helpers ────────────────────────────────────────────────────── */
 
   function fmtTime(sec) {
     sec = Math.max(0, Math.round(sec));
     const h = Math.floor(sec / 3600);
     const m = Math.floor((sec % 3600) / 60);
-    const s = sec % 60;
-    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-    return `${m}:${String(s).padStart(2, '0')}`;
+    const ss = sec % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+    return `${m}:${String(ss).padStart(2, '0')}`;
   }
 
-  async function handleUpload(e) {
+  function toggleScene(idx) {
+    setExpandedScenes(prev => {
+      const next = new Set(prev);
+      next.has(idx) ? next.delete(idx) : next.add(idx);
+      return next;
+    });
+  }
+
+  async function act(fn) {
+    setError(null);
+    setBusy(true);
+    clearProgress();
+    try { await fn(); await reload(); }
+    catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  }
+
+  /* ── Actions ────────────────────────────────────────────────────── */
+
+  const handleYoutubeDownload = (e) => {
+    e.preventDefault();
+    if (!youtubeUrl.trim()) return setError('Paste a YouTube URL');
+    act(() => post(`/projects/${id}/explainer-youtube`, { url: youtubeUrl.trim() }));
+  };
+
+  const handleUpload = (e) => {
     e.preventDefault();
     const files = Array.from(fileInputRef.current?.files || []);
-    if (!files.length) return setError('Pick 1–10 video files (episode order matters)');
-    setError(null); setBusy(true);
-    try {
+    if (!files.length) return setError('Pick 1-10 video files');
+    act(async () => {
       const form = new FormData();
       files.forEach(f => form.append('videos', f));
       const res = await fetch(`/api/projects/${id}/explainer-sources`, { method: 'POST', body: form });
       if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
-      setFileNames(files.map(f => f.name));
-      await reload();
-    } catch (e) { setError(e.message); }
-    finally { setBusy(false); }
-  }
+    });
+  };
 
-  async function runPipeline() {
-    setError(null); setBusy(true);
-    try {
-      await post(`/projects/${id}/explainer/run`, {
-        targetDurationSec: Math.max(60, Number(targetMinutes) * 60),
-        language: 'en',
-        force: forceRefresh,
-        manualSkipWindows: skipWindowsText.trim(),
-      });
-      await reload();
-    } catch (e) { setError(e.message); }
-    finally { setBusy(false); }
-  }
+  const runPipeline = () => act(() => post(`/projects/${id}/explainer/run`, {
+    targetDurationSec: Math.max(60, Number(targetMinutes) * 60),
+    language: 'en', force: forceRefresh,
+    manualSkipWindows: skipWindowsText.trim(),
+  }));
 
-  async function generateVoice() {
-    setError(null); setBusy(true);
-    try {
-      await post(`/projects/${id}/voice/generate`, { voiceId, engine });
-      await reload();
-    } catch (e) { setError(e.message); }
-    finally { setBusy(false); }
-  }
+  const regenerateScript = () => act(() => post(`/projects/${id}/explainer/run`, {
+    targetDurationSec: Math.max(60, Number(targetMinutes) * 60),
+    language: 'en', force: false,
+    manualSkipWindows: skipWindowsText.trim(),
+  }));
 
-  async function renderVideo() {
-    setError(null); setBusy(true);
-    try {
-      await post(`/projects/${id}/render`, { aspect });
-      await reload();
-    } catch (e) { setError(e.message); }
-    finally { setBusy(false); }
-  }
+  const generateVoice = () => act(() => post(`/projects/${id}/voice/generate`, { voiceId, engine }));
+  const renderVideo   = () => act(() => post(`/projects/${id}/render`, { aspect }));
 
-  const state = project?.state || {};
-  const sourceUploaded = state.upload === 'complete' || fileNames.length > 0;
-  const analyzeDone = state.script === 'complete';
-  const voiceDone   = state.voice === 'complete';
-  const renderDone  = state.render === 'complete';
-  const lastErr     = (project?.errors || []).slice(-1)[0];
+  /* ── Derived state ──────────────────────────────────────────────── */
 
-  const sourceMin   = project?.stats?.videoDurationSec ? (project.stats.videoDurationSec / 60).toFixed(1) : null;
-  const beatCount   = project?.stats?.panelCount;
-  const wordCount   = project?.stats?.scriptWordCount;
+  const state        = project?.state || {};
+  const sourceReady  = state.upload === 'complete';
+  const analyzeDone  = state.script === 'complete';
+  const voiceDone    = state.voice  === 'complete';
+  const renderDone   = state.render === 'complete';
+  const lastErr      = (project?.errors || []).slice(-1)[0];
+  const sourceMin    = project?.stats?.videoDurationSec ? (project.stats.videoDurationSec / 60).toFixed(1) : null;
+
+  const isWorking = busy || (progress && progress.percent > 0 && progress.percent < 100);
+
+  /* ── Render ─────────────────────────────────────────────────────── */
 
   return (
-    <div style={styles.page} className="fade-in">
-      <div style={styles.title}>{project?.name || 'Anime Explainer'}</div>
-      {sourceMin && (
-        <div style={styles.hint}>
-          Source: {sourceMin} min{beatCount ? ` · ${beatCount} beats` : ''}{wordCount ? ` · ${wordCount} narration words` : ''}
+    <div style={s.page} className="fade-in">
+
+      {/* Header */}
+      <div style={s.header}>
+        <h1 style={s.title}>{project?.name || 'Video Explainer'}</h1>
+        <div style={s.meta}>
+          {sourceMin && <span>Source: {sourceMin} min</span>}
+          {project?.stats?.panelCount > 0 && <span>{project.stats.panelCount} scenes</span>}
+          {project?.stats?.scriptWordCount > 0 && <span>{project.stats.scriptWordCount} words</span>}
+          <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={s.connDot(connected)} />
+            <span style={{ fontSize: 10 }}>{connected ? 'Live' : 'Reconnecting...'}</span>
+          </span>
+        </div>
+      </div>
+
+      {/* Errors */}
+      {error && <div style={s.err}>{error}</div>}
+      {lastErr && !error && <div style={s.err}>Last error ({lastErr.step}): {lastErr.message}</div>}
+
+      {/* Progress bar */}
+      {progress && progress.percent >= 0 && progress.percent < 100 && (
+        <div style={s.card}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={s.stepLabel}>{progress.step}</span>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{progress.percent}%</span>
+          </div>
+          <div style={s.bar}>
+            <div style={{ ...s.barFill, width: `${Math.max(0, Math.min(100, progress.percent))}%` }} />
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{progress.message}</div>
         </div>
       )}
 
-      {error && <div style={styles.errorBanner}>{error}</div>}
-      {lastErr && <div style={styles.errorBanner}>Last error ({lastErr.step}): {lastErr.message}</div>}
-
-      {progress && progress.percent >= 0 && (
-        <div style={styles.card}>
-          <div style={styles.step}>{progress.step}</div>
-          <div style={styles.progress}>{progress.message}</div>
-          <div style={styles.bar}>
-            <div style={{ ...styles.barFill, width: `${Math.max(0, Math.min(100, progress.percent))}%` }} />
-          </div>
-        </div>
-      )}
-
-      <div style={styles.card}>
-        <div style={styles.step}>1 · Upload episodes (in order)</div>
-        {sourceUploaded ? (
-          <div style={styles.progress}>
-            ✓ Source stitched ({fileNames.length ? fileNames.join(', ') : 'episodes.json available'})
-          </div>
+      {/* ── Step 1: Source ──────────────────────────────────────────── */}
+      <div style={s.card}>
+        <div style={s.stepLabel}>Step 1 &middot; Source video</div>
+        {sourceReady ? (
+          <div style={s.done}>Source ready{sourceMin ? ` (${sourceMin} min)` : ''}</div>
         ) : (
-          <form onSubmit={handleUpload} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <input
-              type="file"
-              accept="video/mp4,video/x-matroska,video/quicktime,video/webm"
-              multiple
-              ref={fileInputRef}
-            />
-            <div style={styles.hint}>
-              Select 1-10 episode files. Backend stitches them into one source. File order is preserved.
+          <>
+            <form onSubmit={handleYoutubeDownload} style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+              <div style={{ ...s.field, flex: 2 }}>
+                <label style={s.label}>YouTube URL</label>
+                <input
+                  type="text" placeholder="https://www.youtube.com/watch?v=..."
+                  value={youtubeUrl} onChange={e => setYoutubeUrl(e.target.value)}
+                />
+              </div>
+              <button type="submit" className="btn-primary" disabled={isWorking} style={{ whiteSpace: 'nowrap' }}>
+                Download
+              </button>
+            </form>
+
+            <div style={s.divider}>
+              <div style={s.dividerLine} />
+              <span style={s.dividerText}>or upload files</span>
+              <div style={s.dividerLine} />
             </div>
-            <button type="submit" className="btn-primary" disabled={busy} style={{ alignSelf: 'flex-start' }}>
-              Upload + stitch
-            </button>
-          </form>
+
+            <form onSubmit={handleUpload} style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+              <div style={{ ...s.field, flex: 2 }}>
+                <input type="file" accept="video/mp4,video/x-matroska,video/quicktime,video/webm" multiple ref={fileInputRef} />
+              </div>
+              <button type="submit" className="btn-primary" disabled={isWorking} style={{ whiteSpace: 'nowrap' }}>
+                Upload
+              </button>
+            </form>
+            <div style={s.hint}>Max 10 files, 3 GB each. Server stitches into one source.</div>
+          </>
         )}
       </div>
 
-      <div style={styles.card}>
-        <div style={styles.step}>2 · Analyze → script (OP/ED auto-cut, Gemini multimodal scene breakdown)</div>
-        <div style={styles.row}>
-          <div style={styles.field}>
-            <label>Target output (minutes)</label>
-            <input
-              type="number"
-              min="2"
-              max="180"
-              value={targetMinutes}
-              onChange={e => setTargetMinutes(e.target.value)}
-            />
-            <div style={styles.hint}>
-              Auto mode: ratio &gt; 3.5 = cut, &lt; 2.5 = continuous, else hybrid. Source ÷ target = ratio.
-            </div>
+      {/* ── Step 2: Analyze ─────────────────────────────────────────── */}
+      <div style={{ ...s.card, opacity: sourceReady ? 1 : 0.4, pointerEvents: sourceReady ? 'auto' : 'none' }}>
+        <div style={s.stepLabel}>Step 2 &middot; AI analysis + script</div>
+        <div style={s.row}>
+          <div style={s.field}>
+            <label style={s.label}>Target output (minutes)</label>
+            <input type="number" min="2" max="180" value={targetMinutes} onChange={e => setTargetMinutes(e.target.value)} />
           </div>
-          <button className="btn-primary" onClick={runPipeline} disabled={busy || !sourceUploaded}>
-            {analyzeDone ? 'Re-run analysis' : 'Run analysis'}
+          <button className="btn-primary" onClick={runPipeline} disabled={isWorking || !sourceReady}>
+            {analyzeDone ? 'Re-analyze' : 'Analyze'}
           </button>
         </div>
-        <div style={styles.field}>
-          <label>Manual skip windows (one per line)</label>
-          <textarea
-            rows={4}
-            placeholder={`# Format: M:SS-M:SS or H:MM:SS-H:MM:SS or seconds\n0:00-1:30\n22:00-24:00`}
-            value={skipWindowsText}
-            onChange={e => setSkipWindowsText(e.target.value)}
-            style={{ width: '100%', fontFamily: 'monospace', fontSize: 12, lineHeight: 1.4 }}
-          />
-          <div style={styles.hint}>
-            Time ranges (in the stitched timeline) that should be cut from the output. Use this when
-            OP/ED auto-detection misses a cold open, mid-episode recap, or ED that doesn't sit at
-            the exact episode boundary. Merged with auto-detected OP/ED. Lines starting with <code>#</code> are ignored.
-          </div>
-        </div>
 
-        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-secondary)', cursor: 'pointer' }}>
-          <input type="checkbox" checked={forceRefresh} onChange={e => setForceRefresh(e.target.checked)} />
-          Force re-run from scratch (skip scene-plan + OP/ED cache — costs ~$0.90 in Gemini if free tier is exhausted)
-        </label>
-        <div style={styles.hint}>
-          By default, re-running with the same source skips the Gemini multimodal breakdown
-          (the most expensive step). Only the scene-selection + script-writer steps re-run.
-          Changing the skip windows above does NOT require force — they're applied dynamically
-          on top of the cached scene plan.
-        </div>
-        {analyzeDone && <div style={styles.progress}>✓ Script + scenes ready</div>}
+        <details>
+          <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--text-secondary)' }}>
+            Skip windows + advanced options
+          </summary>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+            <div style={s.field}>
+              <label style={s.label}>Manual skip windows (one per line)</label>
+              <textarea
+                rows={3}
+                placeholder={`0:00-1:30\n22:00-24:00`}
+                value={skipWindowsText}
+                onChange={e => setSkipWindowsText(e.target.value)}
+                style={{ fontFamily: 'monospace', fontSize: 12 }}
+              />
+              <div style={s.hint}>
+                Time ranges to cut (stitched timeline). Merged with auto-detected OP/ED.
+              </div>
+            </div>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-secondary)', cursor: 'pointer' }}>
+              <input type="checkbox" checked={forceRefresh} onChange={e => setForceRefresh(e.target.checked)} />
+              Force full re-analysis (skip cache)
+            </label>
+          </div>
+        </details>
+
+        {analyzeDone && <div style={s.done}>Script + scenes ready</div>}
       </div>
 
+      {/* ── Preview ─────────────────────────────────────────────────── */}
       {analyzeDone && preview && (
-        <div style={styles.card}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <div style={styles.step}>Analysis preview — what the narrator will say + what scenes will play</div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button type="button" className="btn-secondary" onClick={regenerateScript} disabled={busy}>
-                Re-generate script (keep scene plan)
+        <div style={s.card}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+            <div style={s.stepLabel}>Script preview</div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button className="btn-secondary" onClick={regenerateScript} disabled={isWorking} style={{ fontSize: 11, padding: '4px 10px' }}>
+                Re-generate script
               </button>
-              <button type="button" className="btn-secondary" onClick={() => setPreviewOpen(o => !o)}>
+              <button className="btn-secondary" onClick={() => setPreviewOpen(o => !o)} style={{ fontSize: 11, padding: '4px 10px' }}>
                 {previewOpen ? 'Collapse' : 'Expand'}
               </button>
             </div>
           </div>
 
           {previewOpen && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               <div>
-                <div style={{ fontSize: 18, fontWeight: 600 }}>{preview.title || '(untitled)'}</div>
-                {preview.hook && <div style={{ fontStyle: 'italic', color: 'var(--text-secondary)', marginTop: 4 }}>"{preview.hook}"</div>}
+                <div style={{ fontSize: 16, fontWeight: 600 }}>{preview.title || '(untitled)'}</div>
+                {preview.hook && <div style={{ fontStyle: 'italic', color: 'var(--text-secondary)', marginTop: 4, fontSize: 13 }}>"{preview.hook}"</div>}
               </div>
 
-              <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, color: 'var(--text-muted)' }}>
+              <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 11, color: 'var(--text-muted)' }}>
                 <span>{preview.stats.sceneCount} scenes</span>
                 <span>{preview.stats.totalWords} words</span>
                 {preview.stats.mode && <span>mode: {preview.stats.mode}</span>}
                 {preview.stats.sourceDurationSec && <span>source: {fmtTime(preview.stats.sourceDurationSec)}</span>}
                 {preview.stats.targetDurationSec && <span>target: {fmtTime(preview.stats.targetDurationSec)}</span>}
-                {preview.stats.coveredDurationSec > 0 && <span>covered: {fmtTime(preview.stats.coveredDurationSec)}</span>}
               </div>
 
               {preview.bundle && (
                 <details>
-                  <summary style={{ cursor: 'pointer', fontSize: 13, color: 'var(--text-secondary)' }}>
-                    Story arc + characters (the narrator's full context)
+                  <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--text-secondary)' }}>
+                    Content context (what the narrator knows)
                   </summary>
-                  <div style={{ padding: '8px 0', display: 'flex', flexDirection: 'column', gap: 8, fontSize: 12, color: 'var(--text-secondary)' }}>
-                    {preview.bundle.arcSummary && (
-                      <div><strong>Arc:</strong> {preview.bundle.arcSummary}</div>
-                    )}
+                  <div style={{ padding: '6px 0', fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                    {preview.bundle.arcSummary && <div><strong>Summary:</strong> {preview.bundle.arcSummary}</div>}
                     {Array.isArray(preview.bundle.characters) && preview.bundle.characters.length > 0 && (
-                      <div>
-                        <strong>Characters:</strong>
-                        <ul style={{ marginTop: 4, paddingLeft: 18, lineHeight: 1.5 }}>
-                          {preview.bundle.characters.map((c, i) => (
-                            <li key={i}><strong>{c.name}:</strong> {c.role}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                    {Array.isArray(preview.bundle.episodeRecap) && preview.bundle.episodeRecap.length > 0 && (
-                      <div>
-                        <strong>Episode recap:</strong>
-                        <ul style={{ marginTop: 4, paddingLeft: 18, lineHeight: 1.5 }}>
-                          {preview.bundle.episodeRecap.map((e, i) => (
-                            <li key={i}>Ep {e.episodeIdx + 1} — {e.title}: {e.oneLine}</li>
-                          ))}
-                        </ul>
+                      <div style={{ marginTop: 4 }}>
+                        <strong>Speakers:</strong>{' '}
+                        {preview.bundle.characters.map(c => `${c.name} (${c.role})`).join(', ')}
                       </div>
                     )}
                     {Array.isArray(preview.bundle.throughLines) && preview.bundle.throughLines.length > 0 && (
-                      <div><strong>Through lines:</strong> {preview.bundle.throughLines.join('; ')}</div>
+                      <div style={{ marginTop: 4 }}><strong>Key threads:</strong> {preview.bundle.throughLines.join('; ')}</div>
                     )}
-                    {preview.bundle.endsOn && <div><strong>Ends on:</strong> {preview.bundle.endsOn}</div>}
                   </div>
                 </details>
               )}
 
-              {((preview.skipWindows.op?.length || 0) + (preview.skipWindows.ed?.length || 0) + (preview.skipWindows.manual?.length || 0)) > 0 && (
-                <details>
-                  <summary style={{ cursor: 'pointer', fontSize: 13, color: 'var(--text-secondary)' }}>
-                    Skip windows applied ({(preview.skipWindows.op?.length || 0) + (preview.skipWindows.ed?.length || 0)} auto + {preview.skipWindows.manual?.length || 0} manual)
-                  </summary>
-                  <div style={{ padding: '8px 0', fontSize: 12, fontFamily: 'monospace', color: 'var(--text-secondary)' }}>
-                    {(preview.skipWindows.op || []).map((w, i) => <div key={`op-${i}`}>OP  {fmtTime(w.startSec)}–{fmtTime(w.endSec)}</div>)}
-                    {(preview.skipWindows.ed || []).map((w, i) => <div key={`ed-${i}`}>ED  {fmtTime(w.startSec)}–{fmtTime(w.endSec)}</div>)}
-                    {(preview.skipWindows.manual || []).map((w, i) => <div key={`m-${i}`}>MAN {fmtTime(w.startSec)}–{fmtTime(w.endSec)}</div>)}
-                  </div>
-                </details>
-              )}
-
-              <div style={{ borderTop: '1px solid var(--glass-border)', paddingTop: 12 }}>
-                <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 8 }}>
-                  Per-scene breakdown ({preview.scenes.length}) — click a row to expand
+              {/* Scene list */}
+              <div style={{ borderTop: '1px solid var(--glass-border)', paddingTop: 8 }}>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>
+                  {preview.scenes.length} scenes — click to expand
                 </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 600, overflowY: 'auto', paddingRight: 4 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 500, overflowY: 'auto' }}>
                   {preview.scenes.map(sc => {
                     const isOpen = expandedScenes.has(sc.sceneIndex);
                     return (
                       <div key={sc.sceneIndex} style={{
                         border: '1px solid var(--glass-border)', borderRadius: 6,
-                        padding: '8px 12px', background: 'rgba(255,255,255,0.02)',
+                        padding: '6px 10px', background: 'rgba(255,255,255,0.02)',
                       }}>
                         <div
                           onClick={() => toggleScene(sc.sceneIndex)}
-                          style={{ cursor: 'pointer', display: 'flex', gap: 12, alignItems: 'center', fontSize: 12 }}
+                          style={{ cursor: 'pointer', display: 'flex', gap: 10, alignItems: 'center', fontSize: 11 }}
                         >
-                          <span style={{ color: 'var(--text-muted)', minWidth: 28, textAlign: 'right' }}>#{sc.sceneIndex}</span>
-                          <span style={{ color: 'var(--text-muted)', fontFamily: 'monospace', minWidth: 110 }}>
-                            {fmtTime(sc.sourceStart)}–{fmtTime(sc.sourceEnd)}
+                          <span style={{ color: 'var(--text-muted)', minWidth: 24, textAlign: 'right', fontFamily: 'monospace' }}>#{sc.sceneIndex}</span>
+                          <span style={{ color: 'var(--text-muted)', fontFamily: 'monospace', minWidth: 90 }}>
+                            {fmtTime(sc.sourceStart)}-{fmtTime(sc.sourceEnd)}
                           </span>
-                          <span style={{ color: 'var(--text-muted)', minWidth: 40 }}>{Math.round(sc.durationSec)}s</span>
-                          {sc.mood && <span style={{ color: 'var(--accent-purple)', minWidth: 70 }}>{sc.mood}</span>}
-                          <span style={{ flex: 1, color: 'var(--text-primary)' }}>
-                            {(sc.narration || '').slice(0, 110)}{(sc.narration || '').length > 110 ? '…' : ''}
+                          {sc.mood && <span style={{ color: 'var(--accent-purple)', minWidth: 60, fontSize: 10 }}>{sc.mood}</span>}
+                          <span style={{ flex: 1, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {sc.narration || '(breathe)'}
                           </span>
-                          <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>{isOpen ? '▼' : '▶'}</span>
+                          <span style={{ color: 'var(--text-muted)', fontSize: 9 }}>{isOpen ? '\u25BC' : '\u25B6'}</span>
                         </div>
                         {isOpen && (
-                          <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--glass-border)', fontSize: 12, color: 'var(--text-secondary)', display: 'flex', flexDirection: 'column', gap: 6 }}>
-                            {sc.visualDescription && <div><strong style={{ color: 'var(--accent-cyan)' }}>VISUAL:</strong> {sc.visualDescription}</div>}
-                            {sc.dialogueGist && <div><strong style={{ color: 'var(--accent-cyan)' }}>SAYS:</strong> {sc.dialogueGist}</div>}
-                            {sc.dialogueVerbatim && <div><strong style={{ color: 'var(--accent-cyan)' }}>VERBATIM:</strong> {sc.dialogueVerbatim}</div>}
-                            {Array.isArray(sc.characters) && sc.characters.length > 0 && (
-                              <div><strong style={{ color: 'var(--accent-cyan)' }}>CHARACTERS:</strong> {sc.characters.join(', ')}</div>
-                            )}
-                            <div style={{ marginTop: 4, padding: 8, background: 'rgba(139,92,246,0.08)', borderRadius: 4, color: 'var(--text-primary)', lineHeight: 1.5 }}>
-                              <strong style={{ color: 'var(--accent-purple)' }}>NARRATION:</strong> {sc.narration || '(empty)'}
+                          <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid var(--glass-border)', fontSize: 11, color: 'var(--text-secondary)', display: 'flex', flexDirection: 'column', gap: 4 }}>
+                            {sc.visualDescription && <div><strong style={{ color: 'var(--accent-cyan)' }}>Visual:</strong> {sc.visualDescription}</div>}
+                            {sc.dialogueGist && <div><strong style={{ color: 'var(--accent-cyan)' }}>Says:</strong> {sc.dialogueGist}</div>}
+                            {sc.dialogueVerbatim && <div><strong style={{ color: 'var(--accent-cyan)' }}>Verbatim:</strong> {sc.dialogueVerbatim}</div>}
+                            <div style={{ marginTop: 4, padding: 6, background: 'rgba(139,92,246,0.06)', borderRadius: 4, color: 'var(--text-primary)', lineHeight: 1.5 }}>
+                              <strong style={{ color: 'var(--accent-purple)' }}>Narration:</strong> {sc.narration || '(silent / breathe)'}
                             </div>
                           </div>
                         )}
@@ -404,45 +411,50 @@ export default function VideoExplainerPage() {
         </div>
       )}
 
-      <div style={styles.card}>
-        <div style={styles.step}>3 · Generate narration</div>
-        <div style={styles.row}>
-          <div style={styles.field}>
-            <label>Voice</label>
+      {/* ── Step 3: Voice ───────────────────────────────────────────── */}
+      <div style={{ ...s.card, opacity: analyzeDone ? 1 : 0.4, pointerEvents: analyzeDone ? 'auto' : 'none' }}>
+        <div style={s.stepLabel}>Step 3 &middot; Generate narration</div>
+        <div style={s.row}>
+          <div style={s.field}>
+            <label style={s.label}>Voice</label>
             <select value={voiceId} onChange={e => setVoiceId(e.target.value)}>
               {VOICES.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
             </select>
           </div>
-          <div style={styles.field}>
-            <label>Engine</label>
+          <div style={s.field}>
+            <label style={s.label}>Engine</label>
             <select value={engine} onChange={e => setEngine(e.target.value)}>
               <option value="edge">Edge TTS (free)</option>
-              <option value="elevenlabs">ElevenLabs</option>
+              <option value="elevenlabs">ElevenLabs (paid)</option>
             </select>
           </div>
-          <button className="btn-primary" onClick={generateVoice} disabled={busy || !analyzeDone}>
+          <button className="btn-primary" onClick={generateVoice} disabled={isWorking || !analyzeDone}>
             {voiceDone ? 'Re-generate' : 'Generate'}
           </button>
         </div>
-        {voiceDone && <div style={styles.progress}>✓ Narration ready</div>}
+        {voiceDone && <div style={s.done}>Narration audio ready</div>}
       </div>
 
-      <div style={styles.card}>
-        <div style={styles.step}>4 · Render (with YouTube-safety: ducked source audio, +1% pitch shift, OP/ED cut)</div>
-        <div style={styles.row}>
-          <div style={styles.field}>
-            <label>Aspect</label>
+      {/* ── Step 4: Render ──────────────────────────────────────────── */}
+      <div style={{ ...s.card, opacity: voiceDone ? 1 : 0.4, pointerEvents: voiceDone ? 'auto' : 'none' }}>
+        <div style={s.stepLabel}>Step 4 &middot; Render video</div>
+        <div style={s.row}>
+          <div style={s.field}>
+            <label style={s.label}>Aspect ratio</label>
             <select value={aspect} onChange={e => setAspect(e.target.value)}>
               {ASPECTS.map(a => <option key={a.id} value={a.id}>{a.label}</option>)}
             </select>
           </div>
-          <button className="btn-primary" onClick={renderVideo} disabled={busy || !voiceDone}>
-            {renderDone ? 'Re-render' : 'Render explainer'}
+          <button className="btn-primary" onClick={renderVideo} disabled={isWorking || !voiceDone}>
+            {renderDone ? 'Re-render' : 'Render'}
           </button>
           {renderDone && (
-            <a className="btn-secondary" href={`/api/projects/${id}/download`} download>Download</a>
+            <a className="btn-secondary" href={`/api/projects/${id}/download`} download style={{ whiteSpace: 'nowrap' }}>
+              Download
+            </a>
           )}
         </div>
+        {renderDone && <div style={s.done}>Video ready</div>}
       </div>
     </div>
   );

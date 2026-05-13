@@ -2,12 +2,17 @@
  * Write the narrator script for a video_explainer project.
  *
  * Input: scenes from the Gemini visual breakdown + sceneSelector. Each
- * scene carries both VISUAL context and dialogue context, so the narrator
- * can write commentary that MATCHES what's on screen instead of what
- * dialogue happens to say.
+ * scene carries both VISUAL context and dialogue context, plus keyTakeaway
+ * for podcast/interview content.
  *
  * Output (script.json): the standard render contract:
  *   { title, hook, segments: [{ sceneIndex, sourceStart, sourceEnd, text, mood }] }
+ *
+ * Features:
+ *   - Mood-adaptive word budgets (action=fast, emotional=slow, breathe=0)
+ *   - Cold-open hook from the highest-importance scene
+ *   - Previous-batch context for narrator continuity across batches
+ *   - Breathe segments (text="") let original audio play
  *
  * For long projects (40+ scenes) we batch into windows of ~12 scenes per
  * call so the LLM stays focused and the output JSON doesn't truncate.
@@ -24,7 +29,22 @@ import { logger } from '../utils/logger.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROMPT_PATH = path.resolve(__dirname, '..', '..', 'prompts', 'explainer-narration.v1.md');
 
-const WORDS_PER_SECOND = 2.3;
+// Mood-adaptive words-per-second. Action/energy → faster narration,
+// emotional/suspense → slower and more deliberate, breathe → silence.
+const MOOD_WPS = {
+  action:        3.0,
+  energetic:     2.8,
+  comedic:       2.6,
+  inspirational: 2.5,
+  calm:          2.3,
+  reveal:        2.0,
+  dramatic:      2.0,
+  emotional:     1.8,
+  suspense:      1.8,
+  breathe:       0,
+};
+const DEFAULT_WPS = 2.3;
+
 const BATCH_SIZE = 12;
 
 async function getPrompt() {
@@ -42,16 +62,21 @@ function extractJsonObject(text) {
 function formatScenes(scenes, wordBudgets) {
   return scenes.map(s => {
     const dur = s.endSec - s.startSec;
-    const targetWords = wordBudgets?.[s.idx] ?? Math.round(dur * WORDS_PER_SECOND);
+    const targetWords = wordBudgets?.[s.idx] ?? Math.round(dur * DEFAULT_WPS);
     const chars = s.characters?.length ? ` chars=[${s.characters.join(', ')}]` : '';
     const dialogue = (s.dialogueGist || '').slice(0, 300);
     const verbatim = (s.dialogueVerbatim || '').slice(0, 300);
+    const takeaway = (s.keyTakeaway || '').slice(0, 200);
+    const onScreen = (s._outputStart != null && s._outputEnd != null)
+      ? ` | on screen: ~${(s._outputEnd - s._outputStart).toFixed(0)}s`
+      : '';
     return (
-      `SCENE ${s.idx} (${s.startSec.toFixed(1)}-${s.endSec.toFixed(1)}s, ${dur.toFixed(1)}s, ` +
+      `SCENE ${s.idx} (source: ${s.startSec.toFixed(1)}-${s.endSec.toFixed(1)}s${onScreen}, ` +
       `type=${s.type}, mood=${s.mood}, importance=${s.importance},${chars} target ~${targetWords} words)\n` +
       `  VISUAL:   ${s.visualDescription || '(unspecified)'}\n` +
       (dialogue ? `  SAYS:     ${dialogue}\n` : '') +
-      (verbatim ? `  VERBATIM: ${verbatim}\n` : '')
+      (verbatim ? `  VERBATIM: ${verbatim}\n` : '') +
+      (takeaway ? `  KEY TAKEAWAY: ${takeaway}\n` : '')
     ).trimEnd();
   }).join('\n\n');
 }
@@ -77,23 +102,52 @@ export async function writeExplainerScript(projectId, scenes, onProgress = () =>
   if (!scenes.length) throw new Error('No scenes to write narration for');
   const promptTemplate = await getPrompt();
 
-  // Per-scene word budget proportional to its share of total selected time.
-  const totalSceneDur = scenes.reduce((s, sc) => s + (sc.endSec - sc.startSec), 0);
-  const effectiveTarget = targetReelSec || totalSceneDur;
-  const totalWords = Math.round(effectiveTarget * WORDS_PER_SECOND);
-  const wordBudgets = {};
-  for (const s of scenes) {
-    const dur = s.endSec - s.startSec;
-    const share = dur / (totalSceneDur || 1);
-    wordBudgets[s.idx] = Math.max(8, Math.round(share * totalWords));
+  // Compute the same ratio the renderer will use so word budgets match output time.
+  const sourceWindowStart = scenes[0].startSec;
+  const sourceWindowEnd = scenes[scenes.length - 1].endSec;
+  const sourceWindowDur = sourceWindowEnd - sourceWindowStart;
+  const effectiveTarget = targetReelSec || sourceWindowDur;
+  const ratio = sourceWindowDur / effectiveTarget;
+
+  // For CUT mode (ratio > 2.5): use total selected scene dur, not full window
+  const totalSelectedDur = scenes.reduce((s, sc) => s + (sc.endSec - sc.startSec), 0);
+  const useCutMode = ratio > 2.5;
+  const renderMode = ratio < 1.0 ? 'stretch' : (useCutMode ? 'cut' : 'continuous');
+  const effectiveSourceDur = useCutMode ? totalSelectedDur : sourceWindowDur;
+  const effectiveRatio = effectiveSourceDur / effectiveTarget;
+
+  // Output-time position of each scene
+  if (useCutMode) {
+    let cursor = 0;
+    for (const s of scenes) {
+      const sceneDur = s.endSec - s.startSec;
+      s._outputStart = cursor;
+      s._outputEnd = cursor + sceneDur / effectiveRatio;
+      cursor = s._outputEnd;
+    }
+  } else {
+    for (const s of scenes) {
+      s._outputStart = (s.startSec - sourceWindowStart) / effectiveRatio;
+      s._outputEnd = (s.endSec - sourceWindowStart) / effectiveRatio;
+    }
   }
+
+  // Mood-adaptive word budgets
+  const wordBudgets = {};
+  for (let i = 0; i < scenes.length; i++) {
+    const start = scenes[i]._outputStart;
+    const end = (i < scenes.length - 1) ? scenes[i + 1]._outputStart : scenes[i]._outputEnd;
+    const moodKey = (scenes[i].mood || '').toLowerCase();
+    const wps = MOOD_WPS[moodKey] || DEFAULT_WPS;
+    wordBudgets[scenes[i].idx] = wps > 0 ? Math.max(8, Math.round((end - start) * wps)) : 0;
+  }
+  const totalWords = Object.values(wordBudgets).reduce((a, b) => a + b, 0);
   logger.info(
-    `[explainerScriptWriter] target=${effectiveTarget.toFixed(0)}s totalWords=${totalWords} scenes=${scenes.length}`
+    `[explainerScriptWriter] target=${effectiveTarget.toFixed(0)}s totalWords=${totalWords} ` +
+    `scenes=${scenes.length} ratio=${ratio.toFixed(2)} mode=${renderMode}`
   );
 
-  // Rich story context — the bundleSummary is the difference between bland,
-  // dialogue-paraphrasing narration and narration that knows the arc, recalls
-  // setups, foreshadows reveals, and uses character names confidently.
+  // Rich story context
   const charactersBlock = (bundleSummary?.characters || [])
     .map(c => `- ${c.name}: ${c.role}`)
     .join('\n') || '(infer from scenes)';
@@ -102,16 +156,20 @@ export async function writeExplainerScript(projectId, scenes, onProgress = () =>
     .join('\n');
 
   const contextBlock =
-    `BUNDLE TITLE: ${bundleSummary?.bundleTitle || 'Anime Explainer'}\n\n` +
-    `ARC SUMMARY:\n${bundleSummary?.arcSummary || '(infer from scenes in order)'}\n\n` +
-    `CHARACTERS:\n${charactersBlock}\n\n` +
-    (episodeBlock ? `EPISODE RECAP:\n${episodeBlock}\n\n` : '') +
+    `CONTENT TITLE: ${bundleSummary?.bundleTitle || 'Video Recap'}\n\n` +
+    `SUMMARY:\n${bundleSummary?.arcSummary || '(infer from scenes in order)'}\n\n` +
+    `SPEAKERS / CHARACTERS:\n${charactersBlock}\n\n` +
+    (episodeBlock ? `SECTION RECAP:\n${episodeBlock}\n\n` : '') +
     `THROUGH LINES: ${(bundleSummary?.throughLines || []).join('; ')}\n` +
     `ENDS ON: ${bundleSummary?.endsOn || ''}\n`;
 
+  // Find the most powerful moment for cold-open teaser
+  const climaxScene = scenes.reduce((max, s) =>
+    (s.importance || 0) > (max?.importance || 0) ? s : max, scenes[0]);
+
   const batches = chunk(scenes, BATCH_SIZE);
   const allSegments = [];
-  let title = bundleSummary?.bundleTitle || 'Anime Explainer';
+  let title = bundleSummary?.bundleTitle || 'Video Recap';
   let hook  = '';
 
   for (let b = 0; b < batches.length; b++) {
@@ -124,11 +182,20 @@ export async function writeExplainerScript(projectId, scenes, onProgress = () =>
 
     const isFirst = b === 0;
     const hookInstruction = isFirst
-      ? `Write the hook + segments for this batch.`
+      ? `Write the hook + segments for this batch.\n` +
+        `COLD OPEN: The most powerful moment is Scene ${climaxScene.idx}: ` +
+        `"${(climaxScene.keyTakeaway || climaxScene.visualDescription || climaxScene.dialogueGist || '').slice(0, 200)}". ` +
+        `Tease this in your hook WITHOUT spoiling it — make the viewer NEED to keep watching.`
       : `This is batch ${b + 1} of ${batches.length} — DO NOT write a hook (leave hook empty).`;
 
+    // Pass previous batch output for narrator continuity
+    const previousNarration = allSegments.length > 0
+      ? `\nPREVIOUSLY NARRATED (maintain flow, don't repeat):\n` +
+        allSegments.slice(-3).map(s => `  [Scene ${s.sceneIndex}] ${s.text || '(breathe)'}`).join('\n') + '\n'
+      : '';
+
     const prompt =
-      `${promptTemplate}\n\n${contextBlock}\n${hookInstruction}\n\n` +
+      `${promptTemplate}\n\n${contextBlock}\n${hookInstruction}\n${previousNarration}\n` +
       `SCENES:\n${formatScenes(batchScenes, wordBudgets)}`;
 
     let parsed;
@@ -144,7 +211,7 @@ export async function writeExplainerScript(projectId, scenes, onProgress = () =>
         title, hook: '',
         segments: batchScenes.map(s => ({
           sceneIndex: s.idx,
-          text: s.visualDescription || s.dialogueGist || 'Continuing...',
+          text: s.keyTakeaway || s.visualDescription || s.dialogueGist || 'Continuing...',
           mood: s.mood || 'calm',
         })),
       };
@@ -162,18 +229,26 @@ export async function writeExplainerScript(projectId, scenes, onProgress = () =>
         sceneIndex: scene.idx,
         sourceStart: scene.startSec,
         sourceEnd:   scene.endSec,
-        text: s?.text?.trim() || scene.visualDescription || scene.dialogueGist || '',
+        outputStart: scene._outputStart,
+        outputEnd:   scene._outputEnd,
+        text: s?.text?.trim() || '',
         mood: (s?.mood || scene.mood || 'calm').toLowerCase(),
       });
     }
   }
 
   allSegments.sort((a, b) => a.sceneIndex - b.sceneIndex);
+
+  const breatheCount = allSegments.filter(s => !s.text || s.mood === 'breathe').length;
+  logger.info(`[explainerScriptWriter] breathe segments: ${breatheCount}/${allSegments.length}`);
+
   const script = {
     title,
     hook,
     segments: allSegments,
     projectType: 'video_explainer',
+    speedRatio: ratio,
+    renderMode,
     sourceWindow: {
       startSec: scenes[0].startSec,
       endSec: scenes[scenes.length - 1].endSec,

@@ -13,6 +13,11 @@ router.get('/:projectId', (req, res) => {
   // Send initial heartbeat
   res.write(`data: ${JSON.stringify({ step: 'connected', message: 'SSE connected', percent: 0 })}\n\n`);
 
+  // Keep-alive: send a comment every 15s so proxies/browsers don't close the connection
+  const heartbeat = setInterval(() => {
+    res.write(': heartbeat\n\n');
+  }, 15000);
+
   const onProgress = (data) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
@@ -20,6 +25,7 @@ router.get('/:projectId', (req, res) => {
   progressEmitter.on(req.params.projectId, onProgress);
 
   req.on('close', () => {
+    clearInterval(heartbeat);
     progressEmitter.off(req.params.projectId, onProgress);
   });
 });

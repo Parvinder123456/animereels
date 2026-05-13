@@ -2,11 +2,10 @@
  * subtitleGenerator.js
  *
  * Converts word-level timestamps into a burned-in ASS subtitle file.
- * Style: YouTube manhwa recap creator style —
- *   - Large bold white text, thick black outline
+ * Style: Clean podcast recap —
+ *   - Bold white text, black outline, no karaoke highlight
  *   - 3-4 words per line grouped by natural speech pauses
- *   - Current word highlighted in yellow (karaoke tag {\k})
- *   - Positioned at the bottom-center (safe for 9:16 vertical video)
+ *   - Positioned at the bottom-center
  */
 
 import fs from 'fs/promises';
@@ -24,7 +23,6 @@ const VIDEO_HEIGHT = 1920;
 
 // Colours in ASS &HAABBGGRR format
 const COLOUR_WHITE = '&H00FFFFFF';
-const COLOUR_YELLOW = '&H0000FFFF';  // highlight for active word
 const COLOUR_OUTLINE = '&H00000000';  // black
 const COLOUR_SHADOW = '&H80000000';  // semi-transparent black
 
@@ -39,7 +37,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Recap,Montserrat,${FONT_SIZE},${COLOUR_WHITE},${COLOUR_WHITE},${COLOUR_OUTLINE},${COLOUR_SHADOW},-1,0,0,0,100,100,2,0,4,5,2,2,60,60,120,1
+Style: Recap,Montserrat,${FONT_SIZE},${COLOUR_WHITE},${COLOUR_WHITE},${COLOUR_OUTLINE},${COLOUR_SHADOW},-1,0,0,0,100,100,2,0,1,4,2,2,60,60,120,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -93,32 +91,17 @@ function groupWordsIntoChunks(words) {
 
 /**
  * Builds one ASS Dialogue line for a chunk of words.
- * Uses ASS karaoke tags {\k<cs>} to highlight each word as it's spoken.
- *
- * ASS {\k<cs>} advances the highlight by <cs> centiseconds (1/100 of a second).
- * All words in the chunk share one Dialogue event (start=first word, end=last word).
+ * Plain white text — no karaoke highlight. Clean podcast style.
  */
 function buildDialogueLine(chunk) {
   const startTime = chunk[0].start;
   const endTime = chunk[chunk.length - 1].end;
-
-  // Build karaoke text: each word gets {\kN}word where N = duration in centiseconds
-  const karaokeText = chunk.map((w, i) => {
-    const wordDuration = Math.max(1, Math.round((w.end - w.start) * 100));
-    // Add a small gap before next word if there's silence
-    let gapCs = 0;
-    if (i < chunk.length - 1) {
-      const nextWord = chunk[i + 1];
-      gapCs = Math.round((nextWord.start - w.end) * 100);
-    }
-    const space = i < chunk.length - 1 ? ' ' : '';
-    return `{\\k${wordDuration}}${w.word}${gapCs > 0 ? `{\\k${gapCs}}` : ''}${space}`;
-  }).join('');
+  const text = chunk.map(w => w.word).join(' ');
 
   const start = toAssTime(startTime);
-  const end = toAssTime(endTime + 0.05); // slight hold so last word doesn't pop
+  const end = toAssTime(endTime + 0.10); // slight hold
 
-  return `Dialogue: 0,${start},${end},Recap,,0,0,0,,${karaokeText}`;
+  return `Dialogue: 0,${start},${end},Recap,,0,0,0,,${text}`;
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────

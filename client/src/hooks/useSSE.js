@@ -1,14 +1,18 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 
 export function useSSE(projectId) {
   const [progress, setProgress] = useState(null);
+  const [connected, setConnected] = useState(false);
   const esRef = useRef(null);
+
+  // Expose a way for the page to clear stale progress after a user action
+  const clearProgress = useCallback(() => setProgress(null), []);
 
   useEffect(() => {
     if (!projectId) return;
 
     let timer = null;
-    let retryDelay = 2000;
+    let retryDelay = 1000;
     let cancelled = false;
 
     function connect() {
@@ -16,11 +20,16 @@ export function useSSE(projectId) {
       const es = new EventSource(`/api/events/${projectId}`);
       esRef.current = es;
 
+      es.onopen = () => {
+        setConnected(true);
+        retryDelay = 1000;
+      };
+
       es.onmessage = (e) => {
         try {
           const data = JSON.parse(e.data);
+          if (data.step === 'connected') return; // ignore initial handshake
           setProgress(data);
-          retryDelay = 2000; // reset on successful message
         } catch {
           // ignore parse errors
         }
@@ -28,10 +37,11 @@ export function useSSE(projectId) {
 
       es.onerror = () => {
         es.close();
+        setConnected(false);
+        // Don't clear progress — keep last known state visible
         if (!cancelled) {
-          setProgress(null); // clear stale progress so 100% doesn't block re-triggers
           timer = setTimeout(connect, retryDelay);
-          retryDelay = Math.min(retryDelay * 2, 30000);
+          retryDelay = Math.min(retryDelay * 1.5, 5000);
         }
       };
     }
@@ -45,5 +55,5 @@ export function useSSE(projectId) {
     };
   }, [projectId]);
 
-  return progress;
+  return { progress, connected, clearProgress };
 }

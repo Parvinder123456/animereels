@@ -1,29 +1,15 @@
 /**
  * Render a video_explainer project to a long-form output.
  *
- * Design principle: narration is the master clock. The video is constructed
- * in ONE ffmpeg invocation whose filter graph mathematically guarantees
- * that the cumulative video duration matches the cumulative narration
- * duration frame-by-frame. There are no per-clip files, no intermediate
- * re-encodes, no concat-demuxer round trips — every source of cumulative
- * drift that the previous renderer suffered from is structurally eliminated.
+ * Three render modes based on source÷target ratio:
+ *   - Stretch  (ratio < 1.0):  slow to 0.85× + brief freeze at scene boundaries
+ *   - Continuous (1.0–2.5):    per-segment speed matched to TTS timing
+ *   - Cut      (ratio > 2.5):  skip gaps, show only selected scenes at per-segment speed
  *
  * Inputs:
- *   data/projects/<id>/source.mp4              — stitched + normalized source
- *   data/projects/<id>/script.json             — { hook, segments:[{beatIndex, sourceStart, sourceEnd, text, mood}] }
- *   data/projects/<id>/audio/narration.mp3     — TTS for hook + all segments
- *   data/projects/<id>/audio/timestamps.json   — { segmentBoundaries:[{startTime, endTime}] }
- *
+ *   source.mp4, script.json, narration.mp3, timestamps.json
  * Output:
- *   data/projects/<id>/output/final.mp4
- *
- * Per-clip strategy (auto-selected by source-vs-narration ratio):
- *   speed-adjust  (0.7 ≤ ratio ≤ 1.5)   — subtle setpts time-warp, looks natural
- *   truncate      (ratio > 1.5)         — source plays at 1× for the first targetDur, rest dropped
- *   freeze        (ratio < 0.7)         — source plays at 1×, last frame freezes to fill
- *
- * Frame-exact distribution: we compute integer frame counts that sum to
- * exactly round(narrationDur × fps), eliminating drift across 50+ beats.
+ *   output/final.mp4
  */
 
 import ffmpeg from 'fluent-ffmpeg';
@@ -45,8 +31,6 @@ const ASPECT_PRESETS = {
 };
 const DEFAULT_ASPECT = '16:9';
 const TARGET_FPS = 25;
-const SPEED_OK_MIN = 0.7;   // outside this range we don't speed-warp — looks bad
-const SPEED_OK_MAX = 1.5;
 
 // ─── Probes ──────────────────────────────────────────────────────────────────
 
@@ -74,163 +58,93 @@ function resolveDims(aspectKey, srcStream) {
   return { width: srcStream?.width || 1920, height: srcStream?.height || 1080 };
 }
 
-// ─── Segment spec: derive target durations from narration boundaries ─────────
-
-/**
- * Compute per-segment target durations from the narration's segmentBoundaries,
- * then distribute integer frame counts so they sum to exactly
- * round(narrationDur * fps). This is what eliminates accumulated drift.
- *
- * @returns {Array<{srcStart, srcEnd, srcDur, targetFrames, targetDur, strategy}>}
- */
-function buildSegmentSpecs(scriptSegments, segmentBoundaries, narrationDur, fps) {
-  // 1. Raw target duration per segment from narration boundaries.
-  const rawTargets = scriptSegments.map((seg, i) => {
-    const b  = segmentBoundaries[i];
-    const nb = segmentBoundaries[i + 1];
-    let dur;
-    if (b && nb) {
-      dur = nb.startTime - b.startTime;
-    } else if (b) {
-      dur = narrationDur - b.startTime;
-    } else {
-      dur = (Number(seg.sourceEnd) || 0) - (Number(seg.sourceStart) || 0);
-    }
-    return Math.max(0.2, dur);
-  });
-
-  // 2. Frame-exact distribution. We allocate integer frame counts via
-  //    cumulative-rounding so the sum equals round(narrationDur * fps).
-  //    Per-clip error stays bounded by ±1 frame; the total never drifts.
-  const totalFrames = Math.round(narrationDur * fps);
-  const rawSum = rawTargets.reduce((s, d) => s + d, 0);
-  const frameCounts = [];
-  let prevCum = 0;
-  let accum = 0;
-  for (let i = 0; i < rawTargets.length; i++) {
-    accum += rawTargets[i];
-    const cum = Math.round((accum / rawSum) * totalFrames);
-    frameCounts.push(Math.max(1, cum - prevCum));
-    prevCum = cum;
-  }
-
-  // 3. Strategy per segment: speed-adjust, truncate, or freeze.
-  return scriptSegments.map((seg, i) => {
-    const srcStart = Math.max(0, Number(seg.sourceStart) || 0);
-    const srcEnd   = Math.max(srcStart + 0.1, Number(seg.sourceEnd) || (srcStart + 5));
-    const srcDur   = srcEnd - srcStart;
-    const targetFrames = frameCounts[i];
-    const targetDur = targetFrames / fps;
-    const ratio = srcDur / targetDur;
-
-    let strategy;
-    if (ratio >= SPEED_OK_MIN && ratio <= SPEED_OK_MAX) {
-      strategy = { kind: 'speed', factor: ratio };
-    } else if (ratio > SPEED_OK_MAX) {
-      strategy = { kind: 'truncate' };
-    } else {
-      strategy = { kind: 'freeze', srcFrames: Math.max(1, Math.round(srcDur * fps)) };
-    }
-
-    return { idx: i, srcStart, srcEnd, srcDur, targetFrames, targetDur, strategy };
-  });
-}
-
-// ─── Filter graph builder ────────────────────────────────────────────────────
-
 function escapeAssPath(p) {
   return p.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "'\\''");
 }
 
-/**
- * Build the filter_complex string. Returns the string AND a list of
- * label names so the caller knows what to -map.
- */
-function buildFilterGraph(specs, dims, fps, narrationDur, subsPath) {
-  const lines = [];
-  const labels = [];
+// ─── Per-segment TTS timing ─────────────────────────────────────────────────
 
-  for (const s of specs) {
-    const inLabel = `v${s.idx}`;
-    const scaleCrop =
-      `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
-      `crop=${dims.width}:${dims.height},setsar=1,fps=${fps}`;
+function computeSegmentTiming(segments, segmentBoundaries, windowStart, windowEnd, narrationDur, renderMode) {
+  const timing = [];
+  const totalFrames = Math.round(narrationDur * TARGET_FPS);
+  let assignedFrames = 0;
+  let fractionalDebt = 0;
 
-    let chain;
-    if (s.strategy.kind === 'speed') {
-      // Read [srcStart, srcEnd] at original rate, then time-warp with setpts.
-      // Then normalize to CFR and clip to exactly targetFrames using trim=end_frame.
-      const inv = (1 / s.strategy.factor).toFixed(6);
-      chain =
-        `[0:v]trim=start=${s.srcStart.toFixed(3)}:end=${s.srcEnd.toFixed(3)},` +
-        `setpts=(PTS-STARTPTS)*${inv},` +
-        `${scaleCrop},` +
-        `trim=end_frame=${s.targetFrames},setpts=PTS-STARTPTS[${inLabel}]`;
-    } else if (s.strategy.kind === 'truncate') {
-      // Source longer than narration window — cut to first targetDur of source.
-      const cutEnd = (s.srcStart + s.targetDur).toFixed(3);
-      chain =
-        `[0:v]trim=start=${s.srcStart.toFixed(3)}:end=${cutEnd},setpts=PTS-STARTPTS,` +
-        `${scaleCrop},` +
-        `trim=end_frame=${s.targetFrames},setpts=PTS-STARTPTS[${inLabel}]`;
+  // Bug 1 fix: if Edge TTS produced leading silence before segment 0 starts
+  // speaking, the first segment's output slot must include that silence so the
+  // video timeline matches the audio timeline. Without this, every segment's
+  // video plays boundary[0].startTime ahead of its narration.
+  const leadingSilence = segmentBoundaries[0]?.startTime || 0;
+  if (leadingSilence > 0.01) {
+    logger.info(`[videoExplainerRenderer] leading silence: ${leadingSilence.toFixed(3)}s — absorbed into segment 0`);
+  }
+
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const boundary = segmentBoundaries[i];
+    const nextBoundary = segmentBoundaries[i + 1];
+
+    // TTS slot: time this segment occupies in the output audio timeline.
+    // First segment starts at output t=0 (not boundary[0].startTime).
+    const slotStart = (i === 0) ? 0 : boundary.startTime;
+    const ttsSlot = nextBoundary
+      ? nextBoundary.startTime - slotStart
+      : narrationDur - slotStart;
+
+    // Source clip boundaries depend on render mode
+    let srcStart = seg.sourceStart;
+    let srcEnd;
+    if (renderMode === 'continuous') {
+      // Include gap footage between scenes for seamless playback
+      srcEnd = (i < segments.length - 1) ? segments[i + 1].sourceStart : windowEnd;
     } else {
-      // Source shorter than narration — play once, freeze last frame to fill.
-      const padFrames = s.targetFrames - s.strategy.srcFrames;
-      const padDur = (padFrames / fps).toFixed(3);
-      chain =
-        `[0:v]trim=start=${s.srcStart.toFixed(3)}:end=${s.srcEnd.toFixed(3)},setpts=PTS-STARTPTS,` +
-        `${scaleCrop},` +
-        `tpad=stop_mode=clone:stop_duration=${padDur},` +
-        `trim=end_frame=${s.targetFrames},setpts=PTS-STARTPTS[${inLabel}]`;
+      srcEnd = seg.sourceEnd;
     }
 
-    lines.push(chain);
-    labels.push(`[${inLabel}]`);
+    let srcDur = Math.max(0.04, srcEnd - srcStart);
+    let speed = srcDur / ttsSlot;
+
+    // Clamp speed: if too fast, trim source (skip unwatchable gap footage)
+    if (speed > 4.0) {
+      srcEnd = srcStart + ttsSlot * 4.0;
+      srcDur = srcEnd - srcStart;
+      speed = 4.0;
+    }
+    speed = Math.max(0.25, speed);
+
+    // Bug 3 fix: carry fractional frame debt forward instead of rounding
+    // each segment independently. Prevents rounding bias that dumps all
+    // error onto the last segment.
+    const exactFrames = ttsSlot * TARGET_FPS + fractionalDebt;
+    let frameCount;
+    if (i === segments.length - 1) {
+      frameCount = totalFrames - assignedFrames;
+    } else {
+      frameCount = Math.round(exactFrames);
+      fractionalDebt = exactFrames - frameCount;
+    }
+    frameCount = Math.max(1, frameCount);
+    assignedFrames += frameCount;
+
+    // Freeze frames for stretch mode when video is shorter than slot
+    const videoFrames = Math.round((srcDur / speed) * TARGET_FPS);
+    const freezeFrames = renderMode === 'stretch'
+      ? Math.max(0, frameCount - videoFrames)
+      : 0;
+
+    timing.push({ srcStart, srcEnd, ttsSlot, speed, frameCount, freezeFrames });
   }
 
-  // Concat all segments into one video stream.
-  lines.push(`${labels.join('')}concat=n=${labels.length}:v=1:a=0[vcat]`);
-
-  // Burn subtitles (if available) into the concatenated stream.
-  if (subsPath) {
-    lines.push(`[vcat]subtitles='${escapeAssPath(subsPath)}'[vout]`);
-  } else {
-    lines.push(`[vcat]copy[vout]`);
-  }
-
-  return lines.join(';\n');
+  return timing;
 }
 
-// ─── One-shot ffmpeg runner ──────────────────────────────────────────────────
-
-async function runOneShot(sourcePath, narrationPath, filterScriptPath, outPath, narrationDur, detailPreset, onProgress) {
-  return new Promise((resolve, reject) => {
-    const cmd = ffmpeg()
-      .setFfmpegPath(getFfmpegPath())
-      .input(sourcePath)
-      .input(narrationPath)
-      .addOption('-filter_complex_script', filterScriptPath)
-      .outputOptions([
-        '-map', '[vout]',
-        '-map', '1:a',
-        '-t', narrationDur.toFixed(3),
-        ...getEncodingOptions(detailPreset),
-        '-c:a', 'aac', '-b:a', '192k',
-        '-movflags', '+faststart',
-      ])
-      .output(outPath);
-
-    cmd.on('progress', (p) => {
-      if (typeof p.percent === 'number' && Number.isFinite(p.percent)) {
-        onProgress(`ffmpeg: ${p.percent.toFixed(1)}% (frame ${p.frames || '?'})`,
-          15 + Math.min(80, Math.round(p.percent * 0.8)));
-      }
-    });
-
-    cmd.on('end', resolve);
-    cmd.on('error', err => reject(new Error(`Render failed: ${err.message}`)));
-    cmd.run();
-  });
+// Build atempo filter chain. FFmpeg atempo only accepts [0.5, 100.0],
+// so speeds < 0.5 need to be chained: atempo=sqrt(s),atempo=sqrt(s).
+function buildAtempo(speed) {
+  speed = Math.max(0.25, Math.min(100, speed));
+  if (speed >= 0.5) return `atempo=${speed.toFixed(6)}`;
+  const s = Math.sqrt(speed);
+  return `atempo=${s.toFixed(6)},atempo=${s.toFixed(6)}`;
 }
 
 // ─── Public entry ─────────────────────────────────────────────────────────────
@@ -251,36 +165,52 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
   const dims = resolveDims(aspectKey, srcStream);
   const detail = getDetailPreset(project?.config?.detail || 'medium');
 
+  // Narration duration = content end (last spoken word + 1s), not raw MP3 duration
   const segmentBoundaries = timestamps?.segmentBoundaries || [];
-  const narrationDur = await ffprobeDuration(narrationPath);
-  const fps = TARGET_FPS;
+  const narrationFileDur = await ffprobeDuration(narrationPath);
+  const lastBoundary = segmentBoundaries[segmentBoundaries.length - 1];
+  const contentEnd = lastBoundary ? lastBoundary.endTime + 1.0 : narrationFileDur;
+  const narrationDur = Math.min(contentEnd, narrationFileDur);
 
-  if (segmentBoundaries.length !== script.segments.length) {
-    logger.warn(
-      `[videoExplainerRenderer] boundary count (${segmentBoundaries.length}) ` +
-      `!= script segment count (${script.segments.length}) — fallback alignments may be used`
-    );
-  }
+  // Source window
+  const sourceDur = await ffprobeDuration(sourcePath);
+  const segments = script.segments;
+  const windowStart = Math.max(0, Number(segments[0].sourceStart) || 0);
+  const windowEnd = Math.min(sourceDur, Number(segments[segments.length - 1].sourceEnd) || sourceDur);
+  const windowDur = windowEnd - windowStart;
+
+  // Determine render mode from script or compute it
+  const ratio = script.speedRatio || (windowDur / narrationDur);
+  const renderMode = script.renderMode || (ratio < 1.0 ? 'stretch' : (ratio > 2.5 ? 'cut' : 'continuous'));
+
   logger.info(
     `[videoExplainerRenderer] aspect=${aspectKey} dims=${dims.width}x${dims.height} ` +
-    `narration=${narrationDur.toFixed(1)}s segments=${script.segments.length}`
+    `narration=${narrationDur.toFixed(1)}s (file=${narrationFileDur.toFixed(1)}s) ` +
+    `source window=${windowStart.toFixed(0)}-${windowEnd.toFixed(0)}s (${windowDur.toFixed(0)}s) ` +
+    `ratio=${ratio.toFixed(2)} mode=${renderMode}`
   );
 
-  // Build per-segment specs with frame-exact distribution.
-  onProgress('Computing frame-exact segment plan...', 4);
-  const specs = buildSegmentSpecs(script.segments, segmentBoundaries, narrationDur, fps);
+  // Per-segment TTS sync: match each video segment to its narration boundary
+  let timing = null;
+  if (segmentBoundaries.length === segments.length) {
+    timing = computeSegmentTiming(segments, segmentBoundaries, windowStart, windowEnd, narrationDur, renderMode);
+    const speeds = timing.map(t => t.speed);
+    logger.info(
+      `[videoExplainerRenderer] per-segment sync: ${timing.length} segs, ` +
+      `speeds=[${Math.min(...speeds).toFixed(2)}..${Math.max(...speeds).toFixed(2)}], ` +
+      `avg=${(speeds.reduce((a, b) => a + b, 0) / speeds.length).toFixed(2)}x`
+    );
+  } else {
+    logger.warn(
+      `[videoExplainerRenderer] segment/boundary count mismatch ` +
+      `(${segments.length} segments vs ${segmentBoundaries.length} boundaries) — ` +
+      `falling back to proportional timing`
+    );
+  }
 
-  // Strategy summary for log.
-  const summary = specs.reduce((m, s) => { m[s.strategy.kind] = (m[s.strategy.kind] || 0) + 1; return m; }, {});
-  logger.info(
-    `[videoExplainerRenderer] strategies: ` +
-    Object.entries(summary).map(([k, v]) => `${k}=${v}`).join(', ') +
-    ` · totalFrames=${specs.reduce((n, s) => n + s.targetFrames, 0)} ` +
-    `(expected ${Math.round(narrationDur * fps)})`
-  );
-
-  // Generate subtitles BEFORE running ffmpeg — we burn them in the same pass.
-  onProgress('Generating subtitles from narration timestamps...', 8);
+  // Generate subtitles
+  onProgress('Generating subtitles from narration timestamps...', 5);
+  await ensureDir(projectPath(projectId, 'output'));
   let subsPath = null;
   try {
     subsPath = await generateProjectSubtitles(projectId, timestamps);
@@ -288,22 +218,331 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
     logger.warn(`[videoExplainerRenderer] subtitle gen failed: ${err.message} — rendering without subs`);
   }
 
-  // Write the filter graph to a file (avoids Windows command-line length limits
-  // for projects with 50+ beats, where the inline string would exceed 8 KB).
-  const filterGraph = buildFilterGraph(specs, dims, fps, narrationDur, subsPath);
   const filterScriptPath = projectPath(projectId, '_filter_graph.txt');
-  await fs.writeFile(filterScriptPath, filterGraph, 'utf-8');
-  logger.info(`[videoExplainerRenderer] filter graph: ${filterGraph.length} bytes, ${specs.length} segments`);
-
-  // One ffmpeg invocation.
-  await ensureDir(projectPath(projectId, 'output'));
   const finalPath = projectPath(projectId, 'output', 'final.mp4');
-  onProgress('Rendering final.mp4 (single ffmpeg pass)...', 12);
-  await runOneShot(sourcePath, narrationPath, filterScriptPath, finalPath, narrationDur, detail, onProgress);
+  let vfChain;
+
+  if (renderMode === 'continuous') {
+    if (timing) {
+      vfChain = buildContinuousFilterGraph(segments, timing, dims, subsPath);
+      onProgress('Rendering final.mp4 (continuous, per-segment sync)...', 10);
+    } else {
+      // Fallback: single trim + uniform speed
+      const speed = Math.min(2.5, Math.max(0.5, ratio));
+      const setptsExpr = `(PTS-STARTPTS)/${speed.toFixed(6)}`;
+      const subFilter = subsPath ? `,subtitles='${escapeAssPath(subsPath)}'` : '';
+      vfChain =
+        `[0:v]trim=start=${windowStart.toFixed(3)}:end=${windowEnd.toFixed(3)},` +
+        `setpts=${setptsExpr},` +
+        `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
+        `crop=${dims.width}:${dims.height},` +
+        `fps=${TARGET_FPS},setsar=1` +
+        `${subFilter}[vout]`;
+      onProgress(`Rendering final.mp4 (continuous, ${speed.toFixed(2)}× playback)...`, 10);
+      logger.info(`[videoExplainerRenderer] continuous speed=${speed.toFixed(3)}x`);
+    }
+
+  } else if (renderMode === 'cut') {
+    vfChain = buildCutFilterGraph(segments, narrationDur, windowStart, dims, subsPath, timing);
+    onProgress('Rendering final.mp4 (cut mode, selected scenes)...', 10);
+
+  } else {
+    vfChain = buildStretchFilterGraph(segments, narrationDur, windowStart, windowDur, dims, subsPath, timing);
+    onProgress('Rendering final.mp4 (stretch mode, slowed + freeze)...', 10);
+  }
+
+  // Ducked source audio bed: mix original audio at low volume under narration.
+  // During breathe segments (narrator silent), source audio is the only thing heard.
+  const srcHasAudio = await new Promise(resolve => {
+    ffmpeg.ffprobe(sourcePath, (err, data) => {
+      if (err) return resolve(false);
+      resolve(data.streams.some(s => s.codec_type === 'audio'));
+    });
+  });
+
+  let audioMapping = '1:a';
+  if (srcHasAudio) {
+    if (timing) {
+      // Bug 2 fix: per-segment source audio matching video speeds so the
+      // ducked audio bed stays in sync with on-screen lips/action.
+      const audioParts = [];
+      const audioLabels = [];
+      for (let i = 0; i < timing.length; i++) {
+        const t = timing[i];
+        audioParts.push(
+          `[0:a]atrim=start=${t.srcStart.toFixed(3)}:end=${t.srcEnd.toFixed(3)},` +
+          `asetpts=PTS-STARTPTS,${buildAtempo(t.speed)},volume=0.18[a${i}]`
+        );
+        audioLabels.push(`[a${i}]`);
+      }
+      vfChain += ';\n' + audioParts.join(';\n');
+      vfChain += `;\n${audioLabels.join('')}concat=n=${timing.length}:v=0:a=1[bed]`;
+      vfChain += `;\n[1:a][bed]amix=inputs=2:duration=first:dropout_transition=0[aout]`;
+      audioMapping = '[aout]';
+      logger.info(`[videoExplainerRenderer] per-segment ducked audio: ${timing.length} clips, volume=0.18`);
+    } else {
+      // Fallback: uniform speed for the whole source window
+      const bedSpeed = Math.max(0.5, Math.min(100, ratio));
+      vfChain += `;\n[0:a]atrim=start=${windowStart.toFixed(3)}:end=${windowEnd.toFixed(3)},` +
+        `asetpts=PTS-STARTPTS,atempo=${bedSpeed.toFixed(6)},volume=0.18[bed];` +
+        `[1:a][bed]amix=inputs=2:duration=first:dropout_transition=0[aout]`;
+      audioMapping = '[aout]';
+      logger.info(`[videoExplainerRenderer] ducked source audio (uniform): speed=${bedSpeed.toFixed(2)}x, volume=0.18`);
+    }
+  } else {
+    logger.info(`[videoExplainerRenderer] no source audio track — narration only`);
+  }
+
+  await fs.writeFile(filterScriptPath, vfChain, 'utf-8');
+  logger.info(`[videoExplainerRenderer] filter: ${vfChain.length} chars, mode=${renderMode}`);
+
+  // Single ffmpeg pass
+  await new Promise((resolve, reject) => {
+    const cmd = ffmpeg()
+      .setFfmpegPath(getFfmpegPath())
+      .input(sourcePath)
+      .input(narrationPath)
+      .addOption('-filter_complex_script', filterScriptPath)
+      .outputOptions([
+        '-map', '[vout]',
+        '-map', audioMapping,
+        '-t', narrationDur.toFixed(3),
+        ...getEncodingOptions(detail),
+        '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
+        '-movflags', '+faststart',
+      ])
+      .output(finalPath);
+
+    cmd.on('progress', (p) => {
+      if (typeof p.percent === 'number' && Number.isFinite(p.percent)) {
+        onProgress(
+          `Encoding (${renderMode}): ${p.percent.toFixed(1)}%`,
+          10 + Math.min(85, Math.round(p.percent * 0.85))
+        );
+      }
+    });
+
+    cmd.on('end', resolve);
+    cmd.on('error', err => reject(new Error(`Render failed: ${err.message}`)));
+    cmd.run();
+  });
 
   try { await fs.unlink(filterScriptPath); } catch {}
 
   onProgress('Render complete', 100);
   logger.info(`[videoExplainerRenderer] final.mp4 written for ${projectId}`);
   return finalPath;
+}
+
+// ─── Continuous mode filter graph (per-segment) ──────────────────────────────
+
+function buildContinuousFilterGraph(segments, timing, dims, subsPath) {
+  const parts = [];
+  const labels = [];
+
+  for (let i = 0; i < segments.length; i++) {
+    const t = timing[i];
+    const label = `s${i}`;
+
+    parts.push(
+      `[0:v]trim=start=${t.srcStart.toFixed(3)}:end=${t.srcEnd.toFixed(3)},` +
+      `setpts=(PTS-STARTPTS)/${t.speed.toFixed(6)},` +
+      `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
+      `crop=${dims.width}:${dims.height},` +
+      `fps=${TARGET_FPS},setsar=1,` +
+      `trim=end_frame=${t.frameCount},setpts=PTS-STARTPTS[${label}]`
+    );
+    labels.push(`[${label}]`);
+  }
+
+  const subFilter = subsPath ? `,subtitles='${escapeAssPath(subsPath)}'` : '';
+  parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${subFilter}[vout]`);
+
+  return parts.join(';\n');
+}
+
+// ─── Cut mode filter graph ────────────────────────────────────────────────────
+
+function buildCutFilterGraph(segments, narrationDur, windowStart, dims, subsPath, timing) {
+  // When timing is available, use per-segment TTS-synced speeds
+  if (timing) {
+    const parts = [];
+    const labels = [];
+
+    for (let i = 0; i < segments.length; i++) {
+      const t = timing[i];
+      const label = `s${i}`;
+
+      parts.push(
+        `[0:v]trim=start=${t.srcStart.toFixed(3)}:end=${t.srcEnd.toFixed(3)},` +
+        `setpts=(PTS-STARTPTS)/${t.speed.toFixed(6)},` +
+        `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
+        `crop=${dims.width}:${dims.height},` +
+        `fps=${TARGET_FPS},setsar=1,` +
+        `trim=end_frame=${t.frameCount},setpts=PTS-STARTPTS[${label}]`
+      );
+      labels.push(`[${label}]`);
+    }
+
+    const subFilter = subsPath ? `,subtitles='${escapeAssPath(subsPath)}'` : '';
+    parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${subFilter}[vout]`);
+
+    logger.info(
+      `[videoExplainerRenderer] cut (TTS-synced): ${segments.length} segments, ` +
+      `totalFrames=${timing.reduce((s, t) => s + t.frameCount, 0)}`
+    );
+
+    return parts.join(';\n');
+  }
+
+  // Fallback: proportional frame allocation with uniform speed
+  const totalSelectedDur = segments.reduce((s, seg) => s + ((seg.sourceEnd - seg.sourceStart) || 0), 0);
+  const cutSpeed = Math.min(2.0, Math.max(1.0, totalSelectedDur / narrationDur));
+  const totalFrames = Math.round(narrationDur * TARGET_FPS);
+
+  const segDurations = segments.map(seg => (seg.sourceEnd - seg.sourceStart) || 0.1);
+  const totalDur = segDurations.reduce((a, b) => a + b, 0);
+  let assignedFrames = 0;
+  const frameAllocs = segDurations.map((d, i) => {
+    if (i === segments.length - 1) return totalFrames - assignedFrames;
+    const f = Math.round((d / totalDur) * totalFrames);
+    assignedFrames += f;
+    return f;
+  });
+
+  const parts = [];
+  const labels = [];
+
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const label = `s${i}`;
+
+    parts.push(
+      `[0:v]trim=start=${seg.sourceStart.toFixed(3)}:end=${seg.sourceEnd.toFixed(3)},` +
+      `setpts=(PTS-STARTPTS)/${cutSpeed.toFixed(6)},` +
+      `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
+      `crop=${dims.width}:${dims.height},` +
+      `fps=${TARGET_FPS},setsar=1,` +
+      `trim=end_frame=${frameAllocs[i]},setpts=PTS-STARTPTS[${label}]`
+    );
+    labels.push(`[${label}]`);
+  }
+
+  const subFilter = subsPath ? `,subtitles='${escapeAssPath(subsPath)}'` : '';
+  parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${subFilter}[vout]`);
+
+  logger.info(
+    `[videoExplainerRenderer] cut: ${segments.length} segments, speed=${cutSpeed.toFixed(2)}x, ` +
+    `totalFrames=${totalFrames}`
+  );
+
+  return parts.join(';\n');
+}
+
+// ─── Stretch mode filter graph ────────────────────────────────────────────────
+
+function buildStretchFilterGraph(segments, narrationDur, windowStart, windowDur, dims, subsPath, timing) {
+  // When timing is available, use per-segment TTS-synced speeds
+  if (timing) {
+    const parts = [];
+    const labels = [];
+
+    for (let i = 0; i < segments.length; i++) {
+      const t = timing[i];
+      const label = `s${i}`;
+
+      let chain =
+        `[0:v]trim=start=${t.srcStart.toFixed(3)}:end=${t.srcEnd.toFixed(3)},` +
+        `setpts=(PTS-STARTPTS)/${t.speed.toFixed(6)},` +
+        `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
+        `crop=${dims.width}:${dims.height},` +
+        `fps=${TARGET_FPS},setsar=1`;
+
+      if (t.freezeFrames > 0) {
+        chain += `,tpad=stop_mode=clone:stop_duration=${(t.freezeFrames / TARGET_FPS).toFixed(3)}`;
+      }
+
+      chain += `,trim=end_frame=${t.frameCount},setpts=PTS-STARTPTS[${label}]`;
+      parts.push(chain);
+      labels.push(`[${label}]`);
+    }
+
+    const subFilter = subsPath ? `,subtitles='${escapeAssPath(subsPath)}'` : '';
+    parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${subFilter}[vout]`);
+
+    logger.info(
+      `[videoExplainerRenderer] stretch (TTS-synced): ${segments.length} segments, ` +
+      `totalFrames=${timing.reduce((s, t) => s + t.frameCount, 0)}`
+    );
+
+    return parts.join(';\n');
+  }
+
+  // Fallback: proportional allocation
+  const totalFrames = Math.round(narrationDur * TARGET_FPS);
+  const effectiveRatio = windowDur / narrationDur;
+
+  const outputTimes = [];
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const outStart = seg.outputStart != null
+      ? seg.outputStart
+      : (seg.sourceStart - windowStart) / effectiveRatio;
+    const outEnd = seg.outputEnd != null
+      ? seg.outputEnd
+      : (seg.sourceEnd - windowStart) / effectiveRatio;
+    const nextStart = (i < segments.length - 1)
+      ? (segments[i + 1].outputStart != null ? segments[i + 1].outputStart : (segments[i + 1].sourceStart - windowStart) / effectiveRatio)
+      : outEnd;
+    outputTimes.push({ outStart, outEnd, windowDur: Math.max(nextStart - outStart, outEnd - outStart) });
+  }
+
+  const totalWindow = outputTimes.reduce((a, t) => a + t.windowDur, 0);
+  let assignedFrames = 0;
+  const frameAllocs = outputTimes.map((t, i) => {
+    if (i === segments.length - 1) return totalFrames - assignedFrames;
+    const f = Math.round((t.windowDur / totalWindow) * totalFrames);
+    assignedFrames += f;
+    return f;
+  });
+
+  const parts = [];
+  const labels = [];
+
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const start = seg.sourceStart;
+    const end = seg.sourceEnd;
+    const sceneDur = end - start;
+    const targetDur = frameAllocs[i] / TARGET_FPS;
+    const label = `s${i}`;
+
+    const speed = Math.max(0.85, sceneDur / targetDur);
+    const videoAfterSpeed = sceneDur / speed;
+    const freezeFrames = Math.max(0, frameAllocs[i] - Math.round(videoAfterSpeed * TARGET_FPS));
+
+    let chain =
+      `[0:v]trim=start=${start.toFixed(3)}:end=${end.toFixed(3)},` +
+      `setpts=(PTS-STARTPTS)/${speed.toFixed(6)},` +
+      `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
+      `crop=${dims.width}:${dims.height},` +
+      `fps=${TARGET_FPS},setsar=1`;
+
+    if (freezeFrames > 0) {
+      chain += `,tpad=stop_mode=clone:stop_duration=${(freezeFrames / TARGET_FPS).toFixed(3)}`;
+    }
+
+    chain += `,trim=end_frame=${frameAllocs[i]},setpts=PTS-STARTPTS[${label}]`;
+    parts.push(chain);
+    labels.push(`[${label}]`);
+  }
+
+  const subFilter = subsPath ? `,subtitles='${escapeAssPath(subsPath)}'` : '';
+  parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${subFilter}[vout]`);
+
+  logger.info(
+    `[videoExplainerRenderer] stretch: ${segments.length} segments, totalFrames=${totalFrames}`
+  );
+
+  return parts.join(';\n');
 }

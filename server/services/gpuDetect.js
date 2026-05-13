@@ -83,7 +83,8 @@ export function getEncodingOptions(detailPreset) {
       '-preset', 'p4',
       '-rc', 'vbr',
       '-cq', String(detailPreset.cq ?? detailPreset.crf),
-      '-b:v', '0',
+      '-b:v', '8M',
+      '-maxrate', '12M',
       '-pix_fmt', 'yuv420p',
     ];
   }

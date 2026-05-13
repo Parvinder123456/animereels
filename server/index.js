@@ -72,7 +72,7 @@ app.use(errorHandler);
 detectNvenc();
 
 app.listen(PORT, () => {
-  logger.info(`AnimeReels server running on http://localhost:${PORT}`);
+  logger.info(`Recap Studio server running on http://localhost:${PORT}`);
 });
 
 export default app;

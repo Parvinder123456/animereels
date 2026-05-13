@@ -203,7 +203,7 @@ export default function Layout({ children }) {
     <div>
       <nav style={styles.nav}>
         <Link to="/" style={{ textDecoration: 'none' }}>
-          <span style={styles.logo} className="gradient-text">AnimeReels</span>
+          <span style={styles.logo} className="gradient-text">Recap Studio</span>
         </Link>
         <div style={styles.links}>
           <Link
@@ -211,12 +211,6 @@ export default function Layout({ children }) {
             style={{ ...styles.navLink, color: location.pathname === '/' ? 'var(--text-primary)' : 'var(--text-secondary)' }}
           >
             Dashboard
-          </Link>
-          <Link
-            to="/series"
-            style={{ ...styles.navLink, color: location.pathname === '/series' ? 'var(--text-primary)' : 'var(--text-secondary)' }}
-          >
-            Series
           </Link>
           <AIBackendDropdown />
         </div>

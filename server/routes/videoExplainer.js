@@ -29,6 +29,7 @@ import {
 } from '../utils/fileHelpers.js';
 import { runJob, emit, isRunning } from '../jobs/processor.js';
 import { stitchEpisodes } from '../services/videoStitcher.js';
+import { downloadYouTubeVideo } from '../services/youtubeDownloader.js';
 import { detectOpEd, mergeSkipWindows, loadCachedOpEd } from '../services/opEdDetector.js';
 import { breakDownVideo, loadCachedPlan, applySkipWindows } from '../services/geminiVideoBreakdown.js';
 import { selectScenes, pickMode } from '../services/sceneSelector.js';
@@ -41,21 +42,19 @@ import { logger } from '../utils/logger.js';
 
 /**
  * Adapt Gemini scene-plan scenes into the {start, end, text} segment
- * shape that storySummarizer expects. We pack VISUAL + DIALOGUE per
- * segment so the summarizer sees what's happening on screen alongside
- * what's being said — gives it real story understanding, not just
- * dialogue paraphrasing.
+ * shape that storySummarizer expects. For podcast/interview content the
+ * dialogue and takeaway carry 90% of the signal; visuals are secondary.
+ * For narrative content, visuals matter more.
  */
 function scenesToTranscriptLikeSegments(scenes) {
-  return scenes.map(s => ({
-    start: s.startSec,
-    end: s.endSec,
-    text: [
-      `[VISUAL] ${s.visualDescription || '(unspecified)'}`,
-      s.dialogueGist ? `[GIST] ${s.dialogueGist}` : '',
-      s.dialogueVerbatim ? `[SAYS] ${s.dialogueVerbatim}` : '',
-    ].filter(Boolean).join(' '),
-  }));
+  return scenes.map(s => {
+    const parts = [];
+    if (s.keyTakeaway)       parts.push(`[TAKEAWAY] ${s.keyTakeaway}`);
+    if (s.dialogueVerbatim)  parts.push(`[SAYS] ${s.dialogueVerbatim}`);
+    else if (s.dialogueGist) parts.push(`[GIST] ${s.dialogueGist}`);
+    if (s.visualDescription) parts.push(`[VISUAL] ${s.visualDescription}`);
+    return { start: s.startSec, end: s.endSec, text: parts.join(' ') || '(no content)' };
+  });
 }
 
 /**
@@ -166,6 +165,56 @@ router.post('/:id/explainer-sources', validateProject, upload.array('videos', 10
     }).catch(() => {});
 
     res.json({ success: true, fileCount: inputPaths.length });
+  } catch (err) { next(err); }
+});
+
+// ─── POST /:id/explainer-youtube ─────────────────────────────────────────────
+
+router.post('/:id/explainer-youtube', validateProject, async (req, res, next) => {
+  try {
+    const { url } = req.body || {};
+    if (!url || typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
+      return res.status(400).json({ error: 'A valid YouTube URL is required' });
+    }
+
+    const project = req.project;
+    project.config = project.config || {};
+    project.config.projectType = 'video_explainer';
+    project.state.upload = 'processing';
+    await safeWriteJson(projectPath(req.params.id, 'project.json'), project);
+
+    if (isRunning(req.params.id)) return res.status(409).json({ error: 'Job already running' });
+
+    runJob(req.params.id, async () => {
+      try {
+        const dl = await downloadYouTubeVideo(req.params.id, url, (message, percent) => {
+          emit(req.params.id, 'upload', message, percent);
+        });
+
+        // Write episodes.json in the same format stitchEpisodes produces
+        // so the rest of the explainer pipeline works unchanged.
+        const episodes = [{ idx: 0, path: dl.path, durationSec: dl.durationSec, startSec: 0 }];
+        await safeWriteJson(projectPath(req.params.id, 'episodes.json'), {
+          files: episodes,
+          totalSec: dl.durationSec,
+        });
+
+        project.state.upload = 'complete';
+        project.stats.chapterCount = 1;
+        project.stats.videoDurationSec = Math.round(dl.durationSec);
+        if (dl.title) project.name = dl.title;
+        await safeWriteJson(projectPath(req.params.id, 'project.json'), project);
+        emit(req.params.id, 'upload', 'Download complete', 100);
+      } catch (err) {
+        project.state.upload = 'error';
+        project.errors.push({ step: 'upload', message: err.message, at: new Date().toISOString() });
+        await safeWriteJson(projectPath(req.params.id, 'project.json'), project);
+        emit(req.params.id, 'upload', `Error: ${err.message}`, -1);
+        logger.error(`[videoExplainer/youtube] ${req.params.id} failed: ${err.message}`);
+      }
+    }).catch(() => {});
+
+    res.json({ success: true, url });
   } catch (err) { next(err); }
 });
 
@@ -305,10 +354,32 @@ router.post('/:id/explainer/run', validateProject, async (req, res, next) => {
         }
 
         // 4. Mode pick + scene selection to fit target duration.
+        // Safety: drop scenes whose timestamps go beyond the actual source
+        // (Gemini can hallucinate timestamps for short last chunks).
+        const validScenes = plan.scenes.filter(s => s.startSec < totalSec - 1);
+        // Reindex while preserving callbackTo references
+        const oldToNew = new Map();
+        validScenes.forEach((s, i) => {
+          oldToNew.set(s.idx, i);
+          s.endSec = Math.min(s.endSec, totalSec);
+          s.idx = i;
+        });
+        for (const s of validScenes) {
+          if (s.callbackTo != null) {
+            s.callbackTo = oldToNew.has(s.callbackTo) ? oldToNew.get(s.callbackTo) : null;
+          }
+        }
+        if (validScenes.length < plan.scenes.length) {
+          logger.warn(
+            `[videoExplainer] dropped ${plan.scenes.length - validScenes.length} scenes ` +
+            `beyond source duration (${totalSec.toFixed(0)}s)`
+          );
+        }
+
         const mode = pickMode(totalSec, targetDurationSec);
         logger.info(`[videoExplainer] mode=${mode} (source=${(totalSec/60).toFixed(1)}min → target=${(targetDurationSec/60).toFixed(1)}min)`);
         onStep('panels')(`Selecting scenes (mode=${mode})...`, 92);
-        const chosenScenes = selectScenes(plan.scenes, targetDurationSec, mode);
+        const chosenScenes = selectScenes(validScenes, targetDurationSec, mode);
         if (!chosenScenes.length) throw new Error('Scene selector returned zero scenes');
         await safeWriteJson(projectPath(req.params.id, 'beats.json'), { mode, totalSec, targetDurationSec, scenes: chosenScenes });
 
