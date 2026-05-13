@@ -21,6 +21,7 @@ import {
 import { getFfmpegPath, getEncodingOptions } from './gpuDetect.js';
 import { getDetailPreset } from './detailPresets.js';
 import { generateProjectSubtitles } from './subtitleGenerator.js';
+import { pickMusicBed } from './musicBed.js';
 import { logger } from '../utils/logger.js';
 
 const ASPECT_PRESETS = {
@@ -243,6 +244,14 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
       }
     : { enabled: false };
 
+  // Background music bed (off by default — needs explicit opt-in AND a file
+  // in music/ matching the dominant mood).
+  let musicBed = null;
+  if (project?.config?.musicBed) {
+    musicBed = await pickMusicBed(script);
+    if (!musicBed?.path) musicBed = null;
+  }
+
   // Narration duration = content end (last spoken word + 1s), not raw MP3 duration
   const segmentBoundaries = timestamps?.segmentBoundaries || [];
   const narrationFileDur = await ffprobeDuration(narrationPath);
@@ -346,6 +355,18 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
     });
   });
 
+  // Dynamic ducking via sidechaincompress: when the narrator is speaking
+  // (high level on [1:a]), the source/music beds drop; when the narrator
+  // is silent (breathe segments), the beds rise back.
+  //
+  //   threshold=0.05 — narration triggers compression once it exceeds ~−26 dB
+  //   ratio=8        — heavy 8:1 compression when triggered
+  //   attack=20ms    — quick duck onset (responsive)
+  //   release=400ms  — gentle rise back when narrator pauses
+  //   makeup=0       — we set the resting volume manually instead
+  const REST_VOLUME = 0.55;
+  const SIDECHAIN = `sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400:makeup=0`;
+
   let audioMapping = '1:a';
   if (srcHasAudio) {
     // Optional pitch shift on the source bed when hardening is on.
@@ -353,22 +374,8 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
       ? ',' + buildAudioPitchShift()
       : '';
 
-    // Dynamic ducking via sidechaincompress: when the narrator is speaking
-    // (high level on [1:a]), the source bed drops; when the narrator is
-    // silent (breathe segments), the bed rises back to ~55%.
-    //
-    // Params:
-    //   threshold=0.05 — narration triggers compression once it exceeds ~−26 dB
-    //   ratio=8        — heavy 8:1 compression when triggered
-    //   attack=20ms    — quick duck onset (responsive)
-    //   release=400ms  — gentle rise back when narrator pauses
-    //   makeup=0       — we set the resting volume manually instead
-    const REST_VOLUME = 0.55;     // bed level when narrator is silent
-    const SIDECHAIN = `sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400:makeup=0`;
-
+    // Build [bedraw] (the per-segment or uniform source audio at rest volume).
     if (timing) {
-      // Bug 2 fix: per-segment source audio matching video speeds so the
-      // ducked audio bed stays in sync with on-screen lips/action.
       const audioParts = [];
       const audioLabels = [];
       for (let i = 0; i < timing.length; i++) {
@@ -381,24 +388,42 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
       }
       vfChain += ';\n' + audioParts.join(';\n');
       vfChain += `;\n${audioLabels.join('')}concat=n=${timing.length}:v=0:a=1[bedraw]`;
-      // Sidechain duck the bed against the narration. asplit lets us
-      // use [1:a] both as the duck trigger AND as the dominant audio.
-      vfChain += `;\n[1:a]asplit=2[narr1][narr2]`;
-      vfChain += `;\n[bedraw][narr1]${SIDECHAIN}[bedducked]`;
-      vfChain += `;\n[bedducked][narr2]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1.4[aout]`;
-      audioMapping = '[aout]';
-      logger.info(`[videoExplainerRenderer] per-segment ducked audio: ${timing.length} clips, sidechain duck rest=${REST_VOLUME}${pitchTail ? ', +1% pitch' : ''}`);
     } else {
-      // Fallback: uniform speed for the whole source window
       const bedSpeed = Math.max(0.5, Math.min(100, ratio));
       vfChain += `;\n[0:a]atrim=start=${windowStart.toFixed(3)}:end=${windowEnd.toFixed(3)},` +
         `asetpts=PTS-STARTPTS,atempo=${bedSpeed.toFixed(6)}${pitchTail},volume=${REST_VOLUME}[bedraw]`;
+    }
+
+    // Sidechain duck + optional music bed as a third channel.
+    if (musicBed) {
+      // [2:a] is the music input (added via .input() below).
+      // aloop -1 makes it cover any narration length; volume keeps it well under bed.
+      vfChain += `;\n[2:a]aloop=loop=-1:size=2147483647,volume=0.25[musicraw]`;
+      vfChain += `;\n[1:a]asplit=3[narr1][narr2][narr3]`;
+      vfChain += `;\n[bedraw][narr1]${SIDECHAIN}[bedducked]`;
+      vfChain += `;\n[musicraw][narr2]${SIDECHAIN}[musicducked]`;
+      vfChain += `;\n[bedducked][musicducked][narr3]amix=inputs=3:duration=first:dropout_transition=0:weights=1 0.7 1.6[aout]`;
+      logger.info(
+        `[videoExplainerRenderer] audio mix: source-bed + music-bed (${musicBed.file}, mood=${musicBed.dominantMood}) + narrator${pitchTail ? ', +1% pitch on source' : ''}`
+      );
+    } else {
       vfChain += `;\n[1:a]asplit=2[narr1][narr2]`;
       vfChain += `;\n[bedraw][narr1]${SIDECHAIN}[bedducked]`;
       vfChain += `;\n[bedducked][narr2]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1.4[aout]`;
-      audioMapping = '[aout]';
-      logger.info(`[videoExplainerRenderer] ducked source audio (uniform): speed=${bedSpeed.toFixed(2)}x, sidechain duck rest=${REST_VOLUME}${pitchTail ? ', +1% pitch' : ''}`);
+      logger.info(`[videoExplainerRenderer] sidechain duck rest=${REST_VOLUME}${pitchTail ? ', +1% pitch on source' : ''}`);
     }
+    audioMapping = '[aout]';
+  } else if (musicBed) {
+    // No source audio but music bed enabled — mix music + narration only.
+    // [2:a] is the music when no source audio; otherwise this branch is unreachable
+    // since musicBed adds [2:a] to the input list which would conflict with the
+    // srcHasAudio path. To keep input indexing stable we still pass source as [0].
+    vfChain += `;\n[2:a]aloop=loop=-1:size=2147483647,volume=0.30[musicraw]`;
+    vfChain += `;\n[1:a]asplit=2[narr1][narr2]`;
+    vfChain += `;\n[musicraw][narr1]${SIDECHAIN}[musicducked]`;
+    vfChain += `;\n[musicducked][narr2]amix=inputs=2:duration=first:dropout_transition=0:weights=0.7 1.6[aout]`;
+    audioMapping = '[aout]';
+    logger.info(`[videoExplainerRenderer] no source audio — music-bed only (${musicBed.file})`);
   } else {
     logger.info(`[videoExplainerRenderer] no source audio track — narration only`);
   }
@@ -411,7 +436,9 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
     const cmd = ffmpeg()
       .setFfmpegPath(getFfmpegPath())
       .input(sourcePath)
-      .input(narrationPath)
+      .input(narrationPath);
+    if (musicBed) cmd.input(musicBed.path);
+    cmd
       .addOption('-filter_complex_script', filterScriptPath)
       .outputOptions([
         '-map', '[vout]',

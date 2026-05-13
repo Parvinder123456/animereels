@@ -39,6 +39,8 @@ import {
 } from '../services/storySummarizer.js';
 import { writeExplainerScript } from '../services/explainerScriptWriter.js';
 import { generateTitlePack, loadTitlePack } from '../services/titleGenerator.js';
+import { generateThumbnail } from '../services/thumbnailGenerator.js';
+import { translateScript, listSupportedLanguages } from '../services/scriptTranslator.js';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -505,6 +507,68 @@ router.post('/:id/explainer/title', validateProject, async (req, res, next) => {
     const force = req.body?.force === true || req.body?.force === 'true';
     const pack = await generateTitlePack(req.params.id, { force });
     res.json(pack);
+  } catch (err) { next(err); }
+});
+
+// ─── POST /:id/explainer/thumbnail ───────────────────────────────────────────
+
+router.post('/:id/explainer/thumbnail', validateProject, async (req, res, next) => {
+  try {
+    const force = req.body?.force === true || req.body?.force === 'true';
+    const aspect = ['16:9', '9:16', '1:1', 'auto'].includes(req.body?.aspect) ? req.body.aspect : 'auto';
+    const result = await generateThumbnail(req.params.id, { aspect, force });
+    res.json({ ...result, url: `/data/${req.params.id}/output/thumbnail.jpg?t=${Date.now()}` });
+  } catch (err) { next(err); }
+});
+
+// ─── GET /api/projects/:id/explainer/languages ─────────────────────────────
+
+router.get('/:id/explainer/languages', validateProject, async (_req, res, next) => {
+  try { res.json({ languages: listSupportedLanguages() }); }
+  catch (err) { next(err); }
+});
+
+// ─── POST /:id/explainer/translate ───────────────────────────────────────────
+
+router.post('/:id/explainer/translate', validateProject, async (req, res, next) => {
+  try {
+    const language = String(req.body?.language || '').trim().toLowerCase();
+    if (!language) return res.status(400).json({ error: 'language code required' });
+    const force = req.body?.force === true || req.body?.force === 'true';
+
+    // Long-running — run in the job queue with SSE progress.
+    if (isRunning(req.params.id)) return res.status(409).json({ error: 'Job running' });
+    runJob(req.params.id, async () => {
+      try {
+        await translateScript(req.params.id, language, {
+          force,
+          onProgress: (msg, pct) => emit(req.params.id, 'translate', msg, pct),
+        });
+        emit(req.params.id, 'translate', `Translation complete: ${language}`, 100);
+      } catch (err) {
+        emit(req.params.id, 'translate', `Error: ${err.message}`, -1);
+        logger.error(`[explainer/translate] ${err.message}`);
+      }
+    }).catch(() => {});
+    res.json({ started: true, language });
+  } catch (err) { next(err); }
+});
+
+// ─── POST /:id/explainer/config ──────────────────────────────────────────────
+// Light-weight project config setter used by render-step toggles
+// (musicBed, copyrightHardening defaults, channelName, etc.).
+
+router.patch('/:id/explainer/config', validateProject, async (req, res, next) => {
+  try {
+    const project = req.project;
+    project.config = project.config || {};
+
+    const { musicBed, channelName } = req.body || {};
+    if (typeof musicBed === 'boolean') project.config.musicBed = musicBed;
+    if (typeof channelName === 'string') project.config.channelName = channelName.slice(0, 60);
+
+    await safeWriteJson(projectPath(req.params.id, 'project.json'), project);
+    res.json({ ok: true, config: project.config });
   } catch (err) { next(err); }
 });
 

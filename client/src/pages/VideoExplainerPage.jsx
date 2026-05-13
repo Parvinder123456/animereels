@@ -108,6 +108,18 @@ export default function VideoExplainerPage() {
   const [ytUploading, setYtUploading] = useState(false);
   const [ytResult, setYtResult] = useState(null);
 
+  // Music bed toggle (persists in project.config.musicBed)
+  const [musicBedOn, setMusicBedOn] = useState(false);
+
+  // Thumbnail
+  const [thumb, setThumb] = useState(null);
+  const [thumbBusy, setThumbBusy] = useState(false);
+
+  // Translation
+  const [languages, setLanguages] = useState([]);
+  const [translateLang, setTranslateLang] = useState('');
+  const [translating, setTranslating] = useState(false);
+
   // Preview
   const [preview, setPreview] = useState(null);
   const [previewOpen, setPreviewOpen] = useState(true);
@@ -181,6 +193,23 @@ export default function VideoExplainerPage() {
       }).catch(() => setElevenVoices([]));
     }
   }, [engine, elevenVoices]);
+
+  // Music bed toggle hydrates from project.config
+  useEffect(() => {
+    if (typeof project?.config?.musicBed === 'boolean') {
+      setMusicBedOn(project.config.musicBed);
+    }
+  }, [project?.config?.musicBed]);
+
+  // Supported translation languages
+  useEffect(() => {
+    if (analyzeDone && !languages.length) {
+      get(`/projects/${id}/explainer/languages`).then(d => {
+        if (Array.isArray(d?.languages)) setLanguages(d.languages);
+      }).catch(() => {});
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.state?.script]);
 
   /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -272,12 +301,50 @@ export default function VideoExplainerPage() {
       if (titleData?.description) form.append('description', titleData.description);
       if (Array.isArray(titleData?.tags)) form.append('tags', JSON.stringify(titleData.tags));
       form.append('privacy', ytPrivacy);
+      // If a thumbnail was generated, fetch + attach it
+      if (thumb?.url) {
+        try {
+          const tr = await fetch(thumb.url);
+          if (tr.ok) {
+            const blob = await tr.blob();
+            form.append('thumbnail', blob, 'thumbnail.jpg');
+          }
+        } catch {}
+      }
       const res = await fetch(`/api/youtube/upload/${id}`, { method: 'POST', body: form });
       if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
       const data = await res.json();
       setYtResult({ started: data?.started === true });
     } catch (e) { setError(e.message); }
     finally { setYtUploading(false); }
+  };
+
+  const toggleMusicBed = async (next) => {
+    setMusicBedOn(next);
+    try { await fetch(`/api/projects/${id}/explainer/config`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ musicBed: next }),
+    }); } catch {}
+  };
+
+  const generateThumb = async () => {
+    setError(null); setThumbBusy(true);
+    try {
+      const r = await post(`/projects/${id}/explainer/thumbnail`, { aspect, force: true });
+      setThumb(r);
+    } catch (e) { setError(e.message); }
+    finally { setThumbBusy(false); }
+  };
+
+  const translateScriptUI = async () => {
+    if (!translateLang) return setError('Pick a language first');
+    setError(null); setTranslating(true);
+    try {
+      await post(`/projects/${id}/explainer/translate`, { language: translateLang });
+      // The translate job runs in background and posts SSE — we just kick it.
+    } catch (e) { setError(e.message); }
+    finally { setTranslating(false); }
   };
 
   /* ── Derived state ──────────────────────────────────────────────── */
@@ -609,6 +676,11 @@ export default function VideoExplainerPage() {
           )}
         </div>
 
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: 'pointer' }}>
+          <input type="checkbox" checked={musicBedOn} onChange={e => toggleMusicBed(e.target.checked)} />
+          Background music bed (drop .mp3 files in <code>music/</code>, named by mood: lofi-calm.mp3, cinematic-dramatic.mp3, etc.)
+        </label>
+
         <details>
           <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--text-secondary)' }}>
             Copyright hardening (Content ID evasion)
@@ -645,6 +717,44 @@ export default function VideoExplainerPage() {
 
         {renderDone && <div style={s.done}>Video ready</div>}
       </div>
+
+      {/* ── Thumbnail + multi-language (P2 extras) ─────────────────── */}
+      {analyzeDone && (
+        <div style={s.card}>
+          <div style={s.stepLabel}>Thumbnail + translations</div>
+          <div style={s.row}>
+            <button className="btn-secondary" onClick={generateThumb} disabled={thumbBusy}>
+              {thumbBusy ? 'Generating…' : (thumb ? 'Re-generate thumbnail' : 'Generate thumbnail')}
+            </button>
+            {thumb?.url && (
+              <a href={thumb.url} target="_blank" rel="noreferrer" style={{ display: 'inline-block' }}>
+                <img src={thumb.url} alt="thumbnail" style={{ height: 64, borderRadius: 4, border: '1px solid var(--glass-border)' }} />
+              </a>
+            )}
+          </div>
+          {thumb?.placement && (
+            <div style={s.hint}>
+              Headline: <strong>"{thumb.placement.headline}"</strong> · placement {thumb.placement.placement} · color {thumb.placement.accentColor}
+            </div>
+          )}
+
+          <div style={s.row}>
+            <div style={s.field}>
+              <label style={s.label}>Translate script to</label>
+              <select value={translateLang} onChange={e => setTranslateLang(e.target.value)}>
+                <option value="">— pick a language —</option>
+                {languages.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
+              </select>
+            </div>
+            <button className="btn-secondary" onClick={translateScriptUI} disabled={translating || !translateLang}>
+              {translating ? 'Starting…' : 'Translate'}
+            </button>
+          </div>
+          <div style={s.hint}>
+            Produces <code>script-&lt;lang&gt;.json</code>. Generate narration again with a matching voice (e.g. en-IN-PrabhatNeural for Hindi) to render a translated version.
+          </div>
+        </div>
+      )}
 
       {/* ── YouTube upload ──────────────────────────────────────────── */}
       {renderDone && (
