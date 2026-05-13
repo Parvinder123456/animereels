@@ -41,6 +41,8 @@ import { writeExplainerScript } from '../services/explainerScriptWriter.js';
 import { generateTitlePack, loadTitlePack } from '../services/titleGenerator.js';
 import { generateThumbnail } from '../services/thumbnailGenerator.js';
 import { translateScript, listSupportedLanguages } from '../services/scriptTranslator.js';
+import { pickShortsFromScenes, sceneSegmentsToTranscript } from '../services/autoShortsFromScenes.js';
+import { renderShortClips } from '../services/shortsRenderer.js';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -551,6 +553,111 @@ router.post('/:id/explainer/translate', validateProject, async (req, res, next) 
       }
     }).catch(() => {});
     res.json({ started: true, language });
+  } catch (err) { next(err); }
+});
+
+// ─── POST /:id/explainer/shorts ──────────────────────────────────────────────
+// Auto-detect high-importance scene clusters from the cached scene plan and
+// render each as a vertical Short. Reuses shortsRenderer.renderShortClips()
+// so the per-clip ffmpeg path is identical to the manual Shorts flow.
+//
+// Body: { count?, minSec?, maxSec?, importance?, aspect?, subtitles? }
+// Default: 8 Shorts, 30-60s each, importance>=4, 9:16, subtitles on.
+
+router.post('/:id/explainer/shorts', validateProject, async (req, res, next) => {
+  try {
+    if (isRunning(req.params.id)) return res.status(409).json({ error: 'A job is already running' });
+
+    const sourcePath = projectPath(req.params.id, 'source.mp4');
+    if (!await fileExists(sourcePath)) {
+      return res.status(400).json({ error: 'No source video — upload episodes first' });
+    }
+
+    const planEnv = await safeReadJson(projectPath(req.params.id, 'scene-plan.json'));
+    if (!planEnv?.scenes?.length) {
+      return res.status(400).json({ error: 'No scene plan — run analysis first' });
+    }
+
+    const opEd = await safeReadJson(projectPath(req.params.id, 'op-ed-cuts.json'));
+    const manualSkips = req.project?.config?.manualSkipWindows || [];
+    const skipWindows = [
+      ...(opEd?.opCuts || []),
+      ...(opEd?.edCuts || []),
+      ...manualSkips,
+    ];
+
+    const opts = {
+      count:         Math.max(1, Math.min(20, Number(req.body?.count) || 8)),
+      minSec:        Math.max(15, Math.min(90, Number(req.body?.minSec) || 30)),
+      maxSec:        Math.max(20, Math.min(90, Number(req.body?.maxSec) || 60)),
+      minImportance: Math.max(1, Math.min(5, Number(req.body?.importance) || 4)),
+      skipWindows,
+      totalSec:      planEnv.totalSec || Infinity,
+    };
+    const aspect = ['16:9', '9:16', '1:1'].includes(req.body?.aspect) ? req.body.aspect : '9:16';
+    const subtitles = req.body?.subtitles !== false;
+
+    const clips = pickShortsFromScenes(planEnv.scenes, opts);
+    if (!clips.length) {
+      return res.status(400).json({
+        error: `No scenes met importance>=${opts.minImportance}. Try lowering the threshold or re-running analysis.`,
+      });
+    }
+
+    const transcript = sceneSegmentsToTranscript(planEnv.scenes);
+    await safeWriteJson(projectPath(req.params.id, 'shorts-plan.json'), {
+      clips, aspect, subtitles, opts, generatedAt: new Date().toISOString(),
+    });
+
+    runJob(req.params.id, async () => {
+      try {
+        emit(req.params.id, 'shorts', `Rendering ${clips.length} Shorts (${aspect})...`, 2);
+        const results = await renderShortClips(
+          req.params.id, clips, transcript,
+          { aspect, subtitles },
+          (msg, pct) => emit(req.params.id, 'shorts', msg, Math.max(2, Math.min(98, pct))),
+        );
+
+        // Update manifest with rendered file URLs for the UI.
+        const manifest = {
+          aspect, subtitles,
+          generatedAt: new Date().toISOString(),
+          clips: results.map(r => ({
+            index: r.index,
+            filename: r.filename,
+            url: `/data/${req.params.id}/output/${r.filename}`,
+            title: r.title,
+            reason: r.reason,
+            startSec: r.startSec,
+            endSec: r.endSec,
+            durationSec: r.durationSec,
+          })),
+        };
+        await safeWriteJson(projectPath(req.params.id, 'shorts-manifest.json'), manifest);
+        emit(req.params.id, 'shorts', `${results.length} Shorts ready`, 100);
+        logger.info(`[explainer/shorts] ${req.params.id}: ${results.length} clips`);
+      } catch (err) {
+        emit(req.params.id, 'shorts', `Error: ${err.message}`, -1);
+        logger.error(`[explainer/shorts] ${err.message}`);
+      }
+    }).catch(() => {});
+
+    res.json({
+      started: true,
+      planned: clips.length,
+      clips: clips.map(c => ({ title: c.title, startSec: c.startSec, endSec: c.endSec, durationSec: c.durationSec })),
+    });
+  } catch (err) { next(err); }
+});
+
+// ─── GET /:id/explainer/shorts ───────────────────────────────────────────────
+// Return the latest shorts manifest if rendering has run at least once.
+
+router.get('/:id/explainer/shorts', validateProject, async (req, res, next) => {
+  try {
+    const manifest = await safeReadJson(projectPath(req.params.id, 'shorts-manifest.json'));
+    if (!manifest) return res.status(204).end();
+    res.json(manifest);
   } catch (err) { next(err); }
 });
 

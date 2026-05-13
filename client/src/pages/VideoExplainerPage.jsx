@@ -120,6 +120,13 @@ export default function VideoExplainerPage() {
   const [translateLang, setTranslateLang] = useState('');
   const [translating, setTranslating] = useState(false);
 
+  // Auto-Shorts
+  const [shortsManifest, setShortsManifest] = useState(null);
+  const [shortsBusy, setShortsBusy] = useState(false);
+  const [shortsCount, setShortsCount] = useState(8);
+  const [shortsAspect, setShortsAspect] = useState('9:16');
+  const [shortsImportance, setShortsImportance] = useState(4);
+
   // Preview
   const [preview, setPreview] = useState(null);
   const [previewOpen, setPreviewOpen] = useState(true);
@@ -210,6 +217,28 @@ export default function VideoExplainerPage() {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project?.state?.script]);
+
+  // Auto-load Shorts manifest if a previous run exists
+  useEffect(() => {
+    if (project?.state?.script === 'complete') {
+      fetch(`/api/projects/${id}/explainer/shorts`)
+        .then(r => r.status === 200 ? r.json() : null)
+        .then(d => d && setShortsManifest(d))
+        .catch(() => {});
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.state?.script, project?.updatedAt]);
+
+  // SSE 'shorts' step finished → refresh manifest
+  useEffect(() => {
+    if (progress?.step === 'shorts' && progress?.percent === 100) {
+      fetch(`/api/projects/${id}/explainer/shorts`)
+        .then(r => r.status === 200 ? r.json() : null)
+        .then(d => d && setShortsManifest(d))
+        .catch(() => {});
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [progress?.step, progress?.percent]);
 
   /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -345,6 +374,20 @@ export default function VideoExplainerPage() {
       // The translate job runs in background and posts SSE — we just kick it.
     } catch (e) { setError(e.message); }
     finally { setTranslating(false); }
+  };
+
+  const generateShorts = async () => {
+    setError(null); setShortsBusy(true);
+    try {
+      await post(`/projects/${id}/explainer/shorts`, {
+        count: Number(shortsCount),
+        aspect: shortsAspect,
+        importance: Number(shortsImportance),
+        minSec: 30, maxSec: 60, subtitles: true,
+      });
+      // Background job — manifest will refresh via SSE/effect.
+    } catch (e) { setError(e.message); }
+    finally { setShortsBusy(false); }
   };
 
   /* ── Derived state ──────────────────────────────────────────────── */
@@ -753,6 +796,80 @@ export default function VideoExplainerPage() {
           <div style={s.hint}>
             Produces <code>script-&lt;lang&gt;.json</code>. Generate narration again with a matching voice (e.g. en-IN-PrabhatNeural for Hindi) to render a translated version.
           </div>
+        </div>
+      )}
+
+      {/* ── Auto-Shorts ─────────────────────────────────────────────── */}
+      {analyzeDone && (
+        <div style={s.card}>
+          <div style={s.stepLabel}>Auto-Shorts (vertical clips from high-importance scenes)</div>
+          <div style={s.row}>
+            <div style={s.field}>
+              <label style={s.label}>How many</label>
+              <input type="number" min="1" max="20" value={shortsCount} onChange={e => setShortsCount(e.target.value)} />
+            </div>
+            <div style={s.field}>
+              <label style={s.label}>Min importance</label>
+              <select value={shortsImportance} onChange={e => setShortsImportance(Number(e.target.value))}>
+                <option value="3">3 — looser (more clips)</option>
+                <option value="4">4 — balanced</option>
+                <option value="5">5 — strict (only top moments)</option>
+              </select>
+            </div>
+            <div style={s.field}>
+              <label style={s.label}>Aspect</label>
+              <select value={shortsAspect} onChange={e => setShortsAspect(e.target.value)}>
+                <option value="9:16">9:16 Vertical (Shorts/Reels)</option>
+                <option value="1:1">1:1 Square</option>
+                <option value="16:9">16:9 Landscape</option>
+              </select>
+            </div>
+            <button className="btn-secondary" onClick={generateShorts} disabled={shortsBusy}>
+              {shortsBusy ? 'Starting…' : (shortsManifest ? 'Re-generate Shorts' : 'Generate Shorts')}
+            </button>
+          </div>
+          <div style={s.hint}>
+            Pulls clusters of scenes scoring &ge; min importance from the cached scene plan,
+            clamps each to 30-60s, smart-crops to the aspect, and burns subtitles from the
+            scene-level dialogue. No additional Gemini cost.
+          </div>
+
+          {shortsManifest?.clips?.length > 0 && (
+            <div style={{ borderTop: '1px solid var(--glass-border)', paddingTop: 8, marginTop: 4 }}>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>
+                {shortsManifest.clips.length} Shorts ready ({shortsManifest.aspect})
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {shortsManifest.clips.map(c => (
+                  <div key={c.index} style={{
+                    display: 'flex', alignItems: 'center', gap: 10,
+                    padding: '6px 10px', borderRadius: 6,
+                    background: 'rgba(255,255,255,0.02)',
+                    border: '1px solid var(--glass-border)',
+                  }}>
+                    <span style={{ color: 'var(--text-muted)', minWidth: 26, textAlign: 'right', fontFamily: 'monospace', fontSize: 11 }}>
+                      #{String(c.index + 1).padStart(2, '0')}
+                    </span>
+                    <span style={{ color: 'var(--text-muted)', fontFamily: 'monospace', fontSize: 11, minWidth: 90 }}>
+                      {fmtTime(c.startSec)}-{fmtTime(c.endSec)}
+                    </span>
+                    <span style={{ color: 'var(--text-muted)', fontSize: 11, minWidth: 40 }}>
+                      {Math.round(c.durationSec)}s
+                    </span>
+                    <span style={{ flex: 1, color: 'var(--text-primary)', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {c.title}
+                    </span>
+                    <a className="btn-secondary" href={c.url} download style={{ fontSize: 11, padding: '3px 8px' }}>
+                      Download
+                    </a>
+                    <a className="btn-secondary" href={c.url} target="_blank" rel="noreferrer" style={{ fontSize: 11, padding: '3px 8px' }}>
+                      Preview
+                    </a>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
