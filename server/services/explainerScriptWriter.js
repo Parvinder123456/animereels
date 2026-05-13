@@ -87,6 +87,47 @@ function chunk(arr, size) {
   return out;
 }
 
+// ─── Output-format prompt variants ───────────────────────────────────────────
+//
+// Different YouTube formats need different narrator energy + structure.
+// The base prompt covers "Condensed Recap". For other formats we append a
+// stylistic override block that the LLM honors over the base instructions.
+
+const FORMAT_OVERRIDES = {
+  recap: '',
+
+  takeaways: `
+FORMAT OVERRIDE — TOP TAKEAWAYS LISTICLE:
+- Open by promising a numbered count: "Here are the 10 key takeaways from..."
+- Each segment narration must announce its rank: "Takeaway #1:", "Takeaway #2:", etc.
+- Lead each segment with the actionable insight as a one-line headline, then
+  briefly justify why it works.
+- Use confident, declarative language. Drop tentative qualifiers.
+- Hook must promise SPECIFIC, ACTIONABLE value: "These 10 ideas will change
+  how you [X]".
+`.trim(),
+
+  motivational: `
+FORMAT OVERRIDE — APPLY-IT MOTIVATIONAL:
+- Frame every insight as: "Here's how YOU can apply this in your life."
+- Use second person ("you", "your") aggressively. The viewer is the protagonist.
+- Each segment ends with a concrete action the viewer should take TODAY.
+- Energy is high, paces are punchy. Short sentences. Active verbs.
+- Hook is a challenge: "If you're stuck on [X], this episode is your blueprint."
+- End on a call to action: "Try one of these this week. Track the result."
+`.trim(),
+
+  highlights: `
+FORMAT OVERRIDE — BEST MOMENTS HIGHLIGHT REEL:
+- Pace is breathless. Short, punchy narration over the most dramatic beats.
+- Drop framing phrases. Just narrate the moment + why it lands.
+- Use breathe segments aggressively (target 30%+ of segments) — let the
+  speaker's strongest lines hit unaccompanied.
+- Hook is a tease: "These are the moments everyone is talking about."
+- No takeaway summaries. No advice. Pure highlight energy.
+`.trim(),
+};
+
 /**
  * @param {string} projectId
  * @param {Array<object>} scenes        selected scenes from sceneSelector
@@ -97,8 +138,9 @@ function chunk(arr, size) {
  *                                       { bundleTitle, arcSummary, characters,
  *                                         episodeRecap, throughLines, endsOn }
  *                                       Gives the narrator real story context.
+ * @param {string} opts.outputFormat    'recap' | 'takeaways' | 'motivational' | 'highlights'
  */
-export async function writeExplainerScript(projectId, scenes, onProgress = () => {}, { targetReelSec, bundleSummary } = {}) {
+export async function writeExplainerScript(projectId, scenes, onProgress = () => {}, { targetReelSec, bundleSummary, outputFormat = 'recap' } = {}) {
   if (!scenes.length) throw new Error('No scenes to write narration for');
   const promptTemplate = await getPrompt();
 
@@ -194,8 +236,11 @@ export async function writeExplainerScript(projectId, scenes, onProgress = () =>
         allSegments.slice(-3).map(s => `  [Scene ${s.sceneIndex}] ${s.text || '(breathe)'}`).join('\n') + '\n'
       : '';
 
+    const formatBlock = FORMAT_OVERRIDES[outputFormat] || '';
     const prompt =
-      `${promptTemplate}\n\n${contextBlock}\n${hookInstruction}\n${previousNarration}\n` +
+      `${promptTemplate}\n\n${contextBlock}\n` +
+      (formatBlock ? `\n${formatBlock}\n` : '') +
+      `${hookInstruction}\n${previousNarration}\n` +
       `SCENES:\n${formatScenes(batchScenes, wordBudgets)}`;
 
     let parsed;
@@ -247,6 +292,7 @@ export async function writeExplainerScript(projectId, scenes, onProgress = () =>
     hook,
     segments: allSegments,
     projectType: 'video_explainer',
+    outputFormat,
     speedRatio: ratio,
     renderMode,
     sourceWindow: {

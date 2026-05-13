@@ -22,7 +22,7 @@ router.post('/:id/render', validateProject, async (req, res, next) => {
     }
 
     // Extract render config from request body
-    const { duration, detail, format, aspect } = req.body;
+    const { duration, detail, format, aspect, copyrightHardening } = req.body;
     const renderConfig = {};
 
     if (duration && typeof duration === 'number' && duration > 0) {
@@ -38,6 +38,24 @@ router.post('/:id/render', validateProject, async (req, res, next) => {
       renderConfig.aspect = aspect;
     }
 
+    // Copyright hardening: accept either a boolean (use defaults) or an object
+    // { enabled, flip, pitchShift, watermark }
+    let hardenCfg = null;
+    if (copyrightHardening === true) {
+      hardenCfg = { enabled: true, flip: true, pitchShift: true, watermark: '' };
+    } else if (copyrightHardening && typeof copyrightHardening === 'object') {
+      hardenCfg = {
+        enabled: copyrightHardening.enabled !== false,
+        flip: copyrightHardening.flip !== false,
+        pitchShift: copyrightHardening.pitchShift !== false,
+        watermark: typeof copyrightHardening.watermark === 'string'
+          ? copyrightHardening.watermark.slice(0, 60)
+          : '',
+      };
+    } else if (copyrightHardening === false) {
+      hardenCfg = { enabled: false };
+    }
+
     const project = req.project;
 
     // Persist render config to project
@@ -46,6 +64,7 @@ router.post('/:id/render', validateProject, async (req, res, next) => {
     if (renderConfig.detail) project.config.detail = renderConfig.detail;
     if (renderConfig.format) project.config.format = renderConfig.format;
     if (renderConfig.aspect) project.config.aspect = renderConfig.aspect;
+    if (hardenCfg) project.config.copyrightHardening = hardenCfg.enabled ? hardenCfg : false;
 
     runJob(req.params.id, async () => {
       try {

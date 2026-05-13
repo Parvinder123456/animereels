@@ -27,6 +27,28 @@ function getExt(name) {
 
 const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
 
+// GET /elevenlabs/voices — list the user's ElevenLabs voice library
+router.get('/elevenlabs/voices', async (_req, res, next) => {
+  try {
+    const apiKey = process.env.ELEVENLABS_API_KEY;
+    if (!apiKey) return res.status(200).json({ voices: [], reason: 'ELEVENLABS_API_KEY not set' });
+    const r = await fetch('https://api.elevenlabs.io/v1/voices', {
+      headers: { 'xi-api-key': apiKey },
+    });
+    if (!r.ok) {
+      return res.status(200).json({ voices: [], reason: `ElevenLabs API ${r.status}` });
+    }
+    const data = await r.json();
+    const voices = (data.voices || []).map(v => ({
+      id: v.voice_id,
+      label: v.name + (v.labels?.gender ? ` — ${v.labels.gender}` : '') +
+             (v.labels?.accent ? ` (${v.labels.accent})` : ''),
+      category: v.category || 'unknown',
+    }));
+    res.json({ voices });
+  } catch (err) { next(err); }
+});
+
 // POST /:id/voice/generate - generate TTS
 router.post('/:id/voice/generate', validateProject, async (req, res, next) => {
   try {

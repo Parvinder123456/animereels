@@ -62,6 +62,74 @@ function escapeAssPath(p) {
   return p.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "'\\''");
 }
 
+// ─── Copyright hardening ─────────────────────────────────────────────────────
+//
+// Optional video + audio transforms that break Content ID fingerprints
+// without being noticeable to a human viewer. Off by default.
+//
+// Video stack:
+//   hflip                        — mirror the frame
+//   hue=s=1.04                   — saturation +4%
+//   eq=brightness=0.02:contrast=1.03  — brightness +2%, contrast +3%
+//   crop=iw*0.97:ih*0.97,scale=W:H  — ~1.5% crop then back to target dims
+//   drawtext (optional watermark)
+//
+// Audio: +1% pitch shift on the SOURCE BED (not narrator). Realized as
+// asetrate * 1.01, aresample back to 48000, atempo 1/1.01 to keep duration.
+
+const PITCH_SHIFT = 1.01;
+const WIN_FONT = 'C\\:/Windows/Fonts/arialbd.ttf';
+const NIX_FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+
+function escapeDrawtext(text) {
+  return String(text)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, '’')
+    .replace(/:/g, '\\:')
+    .replace(/%/g, '\\%');
+}
+
+/**
+ * Build the per-segment video hardening chain (no subs, no concat).
+ * Returns a comma-prefixed string to be appended after the scale/crop chain,
+ * or "" when hardening is disabled.
+ *
+ * NOTE: per-segment so the concat output dims stay uniform.
+ */
+function buildVideoHardenChain(hardenCfg, dims) {
+  if (!hardenCfg?.enabled) return '';
+  const steps = [];
+  if (hardenCfg.flip !== false) steps.push('hflip');
+  steps.push('hue=s=1.04');
+  steps.push('eq=brightness=0.02:contrast=1.03');
+  steps.push(`crop=floor(iw*0.97/2)*2:floor(ih*0.97/2)*2`);
+  steps.push(`scale=${dims.width}:${dims.height},setsar=1`);
+  return ',' + steps.join(',');
+}
+
+/**
+ * Build the final post-concat overlay chain — watermark goes here so it
+ * doesn't get cropped away by the per-segment hardening.
+ */
+function buildFinalOverlayChain(hardenCfg) {
+  if (!hardenCfg?.enabled) return '';
+  const wm = (hardenCfg.watermark || '').trim();
+  if (!wm) return '';
+  const font = process.platform === 'win32' ? WIN_FONT : NIX_FONT;
+  const text = escapeDrawtext(wm);
+  return (
+    `,drawtext=fontfile='${font}':text='${text}':` +
+    `x=w-tw-24:y=24:fontsize=24:fontcolor=white@0.65:` +
+    `box=1:boxcolor=black@0.45:boxborderw=8`
+  );
+}
+
+function buildAudioPitchShift() {
+  // asetrate raises both pitch and tempo; aresample fixes sample rate;
+  // atempo divides tempo back to 1× so duration is preserved.
+  return `asetrate=48000*${PITCH_SHIFT},aresample=48000,atempo=${(1 / PITCH_SHIFT).toFixed(6)}`;
+}
+
 // ─── Per-segment TTS timing ─────────────────────────────────────────────────
 
 function computeSegmentTiming(segments, segmentBoundaries, windowStart, windowEnd, narrationDur, renderMode) {
@@ -165,6 +233,16 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
   const dims = resolveDims(aspectKey, srcStream);
   const detail = getDetailPreset(project?.config?.detail || 'medium');
 
+  // Copyright hardening config (off unless explicitly enabled).
+  const hardenCfg = project?.config?.copyrightHardening
+    ? {
+        enabled: true,
+        flip: project.config.copyrightHardening.flip !== false,
+        pitchShift: project.config.copyrightHardening.pitchShift !== false,
+        watermark: project.config.copyrightHardening.watermark || project?.config?.channelName || '',
+      }
+    : { enabled: false };
+
   // Narration duration = content end (last spoken word + 1s), not raw MP3 duration
   const segmentBoundaries = timestamps?.segmentBoundaries || [];
   const narrationFileDur = await ffprobeDuration(narrationPath);
@@ -224,31 +302,39 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
 
   if (renderMode === 'continuous') {
     if (timing) {
-      vfChain = buildContinuousFilterGraph(segments, timing, dims, subsPath);
+      vfChain = buildContinuousFilterGraph(segments, timing, dims, subsPath, hardenCfg);
       onProgress('Rendering final.mp4 (continuous, per-segment sync)...', 10);
     } else {
       // Fallback: single trim + uniform speed
       const speed = Math.min(2.5, Math.max(0.5, ratio));
       const setptsExpr = `(PTS-STARTPTS)/${speed.toFixed(6)}`;
+      const hardenInline = buildVideoHardenChain(hardenCfg, dims);
+      const overlayInline = buildFinalOverlayChain(hardenCfg);
       const subFilter = subsPath ? `,subtitles='${escapeAssPath(subsPath)}'` : '';
       vfChain =
         `[0:v]trim=start=${windowStart.toFixed(3)}:end=${windowEnd.toFixed(3)},` +
         `setpts=${setptsExpr},` +
         `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
         `crop=${dims.width}:${dims.height},` +
-        `fps=${TARGET_FPS},setsar=1` +
-        `${subFilter}[vout]`;
+        `fps=${TARGET_FPS},setsar=1${hardenInline}${overlayInline}${subFilter}[vout]`;
       onProgress(`Rendering final.mp4 (continuous, ${speed.toFixed(2)}× playback)...`, 10);
       logger.info(`[videoExplainerRenderer] continuous speed=${speed.toFixed(3)}x`);
     }
 
   } else if (renderMode === 'cut') {
-    vfChain = buildCutFilterGraph(segments, narrationDur, windowStart, dims, subsPath, timing);
+    vfChain = buildCutFilterGraph(segments, narrationDur, windowStart, dims, subsPath, timing, hardenCfg);
     onProgress('Rendering final.mp4 (cut mode, selected scenes)...', 10);
 
   } else {
-    vfChain = buildStretchFilterGraph(segments, narrationDur, windowStart, windowDur, dims, subsPath, timing);
+    vfChain = buildStretchFilterGraph(segments, narrationDur, windowStart, windowDur, dims, subsPath, timing, hardenCfg);
     onProgress('Rendering final.mp4 (stretch mode, slowed + freeze)...', 10);
+  }
+
+  if (hardenCfg.enabled) {
+    logger.info(
+      `[videoExplainerRenderer] copyright hardening: flip=${hardenCfg.flip} ` +
+      `pitchShift=${hardenCfg.pitchShift} watermark=${hardenCfg.watermark ? `"${hardenCfg.watermark}"` : '(none)'}`
+    );
   }
 
   // Ducked source audio bed: mix original audio at low volume under narration.
@@ -262,6 +348,24 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
 
   let audioMapping = '1:a';
   if (srcHasAudio) {
+    // Optional pitch shift on the source bed when hardening is on.
+    const pitchTail = (hardenCfg.enabled && hardenCfg.pitchShift)
+      ? ',' + buildAudioPitchShift()
+      : '';
+
+    // Dynamic ducking via sidechaincompress: when the narrator is speaking
+    // (high level on [1:a]), the source bed drops; when the narrator is
+    // silent (breathe segments), the bed rises back to ~55%.
+    //
+    // Params:
+    //   threshold=0.05 — narration triggers compression once it exceeds ~−26 dB
+    //   ratio=8        — heavy 8:1 compression when triggered
+    //   attack=20ms    — quick duck onset (responsive)
+    //   release=400ms  — gentle rise back when narrator pauses
+    //   makeup=0       — we set the resting volume manually instead
+    const REST_VOLUME = 0.55;     // bed level when narrator is silent
+    const SIDECHAIN = `sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400:makeup=0`;
+
     if (timing) {
       // Bug 2 fix: per-segment source audio matching video speeds so the
       // ducked audio bed stays in sync with on-screen lips/action.
@@ -271,23 +375,29 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
         const t = timing[i];
         audioParts.push(
           `[0:a]atrim=start=${t.srcStart.toFixed(3)}:end=${t.srcEnd.toFixed(3)},` +
-          `asetpts=PTS-STARTPTS,${buildAtempo(t.speed)},volume=0.18[a${i}]`
+          `asetpts=PTS-STARTPTS,${buildAtempo(t.speed)}${pitchTail},volume=${REST_VOLUME}[a${i}]`
         );
         audioLabels.push(`[a${i}]`);
       }
       vfChain += ';\n' + audioParts.join(';\n');
-      vfChain += `;\n${audioLabels.join('')}concat=n=${timing.length}:v=0:a=1[bed]`;
-      vfChain += `;\n[1:a][bed]amix=inputs=2:duration=first:dropout_transition=0[aout]`;
+      vfChain += `;\n${audioLabels.join('')}concat=n=${timing.length}:v=0:a=1[bedraw]`;
+      // Sidechain duck the bed against the narration. asplit lets us
+      // use [1:a] both as the duck trigger AND as the dominant audio.
+      vfChain += `;\n[1:a]asplit=2[narr1][narr2]`;
+      vfChain += `;\n[bedraw][narr1]${SIDECHAIN}[bedducked]`;
+      vfChain += `;\n[bedducked][narr2]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1.4[aout]`;
       audioMapping = '[aout]';
-      logger.info(`[videoExplainerRenderer] per-segment ducked audio: ${timing.length} clips, volume=0.18`);
+      logger.info(`[videoExplainerRenderer] per-segment ducked audio: ${timing.length} clips, sidechain duck rest=${REST_VOLUME}${pitchTail ? ', +1% pitch' : ''}`);
     } else {
       // Fallback: uniform speed for the whole source window
       const bedSpeed = Math.max(0.5, Math.min(100, ratio));
       vfChain += `;\n[0:a]atrim=start=${windowStart.toFixed(3)}:end=${windowEnd.toFixed(3)},` +
-        `asetpts=PTS-STARTPTS,atempo=${bedSpeed.toFixed(6)},volume=0.18[bed];` +
-        `[1:a][bed]amix=inputs=2:duration=first:dropout_transition=0[aout]`;
+        `asetpts=PTS-STARTPTS,atempo=${bedSpeed.toFixed(6)}${pitchTail},volume=${REST_VOLUME}[bedraw]`;
+      vfChain += `;\n[1:a]asplit=2[narr1][narr2]`;
+      vfChain += `;\n[bedraw][narr1]${SIDECHAIN}[bedducked]`;
+      vfChain += `;\n[bedducked][narr2]amix=inputs=2:duration=first:dropout_transition=0:weights=1 1.4[aout]`;
       audioMapping = '[aout]';
-      logger.info(`[videoExplainerRenderer] ducked source audio (uniform): speed=${bedSpeed.toFixed(2)}x, volume=0.18`);
+      logger.info(`[videoExplainerRenderer] ducked source audio (uniform): speed=${bedSpeed.toFixed(2)}x, sidechain duck rest=${REST_VOLUME}${pitchTail ? ', +1% pitch' : ''}`);
     }
   } else {
     logger.info(`[videoExplainerRenderer] no source audio track — narration only`);
@@ -336,9 +446,10 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
 
 // ─── Continuous mode filter graph (per-segment) ──────────────────────────────
 
-function buildContinuousFilterGraph(segments, timing, dims, subsPath) {
+function buildContinuousFilterGraph(segments, timing, dims, subsPath, hardenCfg) {
   const parts = [];
   const labels = [];
+  const hardenInline = buildVideoHardenChain(hardenCfg, dims);
 
   for (let i = 0; i < segments.length; i++) {
     const t = timing[i];
@@ -349,21 +460,25 @@ function buildContinuousFilterGraph(segments, timing, dims, subsPath) {
       `setpts=(PTS-STARTPTS)/${t.speed.toFixed(6)},` +
       `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
       `crop=${dims.width}:${dims.height},` +
-      `fps=${TARGET_FPS},setsar=1,` +
+      `fps=${TARGET_FPS},setsar=1${hardenInline},` +
       `trim=end_frame=${t.frameCount},setpts=PTS-STARTPTS[${label}]`
     );
     labels.push(`[${label}]`);
   }
 
+  const overlayInline = buildFinalOverlayChain(hardenCfg);
   const subFilter = subsPath ? `,subtitles='${escapeAssPath(subsPath)}'` : '';
-  parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${subFilter}[vout]`);
+  parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${overlayInline}${subFilter}[vout]`);
 
   return parts.join(';\n');
 }
 
 // ─── Cut mode filter graph ────────────────────────────────────────────────────
 
-function buildCutFilterGraph(segments, narrationDur, windowStart, dims, subsPath, timing) {
+function buildCutFilterGraph(segments, narrationDur, windowStart, dims, subsPath, timing, hardenCfg) {
+  const hardenInline = buildVideoHardenChain(hardenCfg, dims);
+  const overlayInline = buildFinalOverlayChain(hardenCfg);
+
   // When timing is available, use per-segment TTS-synced speeds
   if (timing) {
     const parts = [];
@@ -378,14 +493,14 @@ function buildCutFilterGraph(segments, narrationDur, windowStart, dims, subsPath
         `setpts=(PTS-STARTPTS)/${t.speed.toFixed(6)},` +
         `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
         `crop=${dims.width}:${dims.height},` +
-        `fps=${TARGET_FPS},setsar=1,` +
+        `fps=${TARGET_FPS},setsar=1${hardenInline},` +
         `trim=end_frame=${t.frameCount},setpts=PTS-STARTPTS[${label}]`
       );
       labels.push(`[${label}]`);
     }
 
     const subFilter = subsPath ? `,subtitles='${escapeAssPath(subsPath)}'` : '';
-    parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${subFilter}[vout]`);
+    parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${overlayInline}${subFilter}[vout]`);
 
     logger.info(
       `[videoExplainerRenderer] cut (TTS-synced): ${segments.length} segments, ` +
@@ -422,14 +537,14 @@ function buildCutFilterGraph(segments, narrationDur, windowStart, dims, subsPath
       `setpts=(PTS-STARTPTS)/${cutSpeed.toFixed(6)},` +
       `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
       `crop=${dims.width}:${dims.height},` +
-      `fps=${TARGET_FPS},setsar=1,` +
+      `fps=${TARGET_FPS},setsar=1${hardenInline},` +
       `trim=end_frame=${frameAllocs[i]},setpts=PTS-STARTPTS[${label}]`
     );
     labels.push(`[${label}]`);
   }
 
   const subFilter = subsPath ? `,subtitles='${escapeAssPath(subsPath)}'` : '';
-  parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${subFilter}[vout]`);
+  parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${overlayInline}${subFilter}[vout]`);
 
   logger.info(
     `[videoExplainerRenderer] cut: ${segments.length} segments, speed=${cutSpeed.toFixed(2)}x, ` +
@@ -441,7 +556,9 @@ function buildCutFilterGraph(segments, narrationDur, windowStart, dims, subsPath
 
 // ─── Stretch mode filter graph ────────────────────────────────────────────────
 
-function buildStretchFilterGraph(segments, narrationDur, windowStart, windowDur, dims, subsPath, timing) {
+function buildStretchFilterGraph(segments, narrationDur, windowStart, windowDur, dims, subsPath, timing, hardenCfg) {
+  const hardenInline = buildVideoHardenChain(hardenCfg, dims);
+  const overlayInline = buildFinalOverlayChain(hardenCfg);
   // When timing is available, use per-segment TTS-synced speeds
   if (timing) {
     const parts = [];
@@ -456,7 +573,7 @@ function buildStretchFilterGraph(segments, narrationDur, windowStart, windowDur,
         `setpts=(PTS-STARTPTS)/${t.speed.toFixed(6)},` +
         `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
         `crop=${dims.width}:${dims.height},` +
-        `fps=${TARGET_FPS},setsar=1`;
+        `fps=${TARGET_FPS},setsar=1${hardenInline}`;
 
       if (t.freezeFrames > 0) {
         chain += `,tpad=stop_mode=clone:stop_duration=${(t.freezeFrames / TARGET_FPS).toFixed(3)}`;
@@ -468,7 +585,7 @@ function buildStretchFilterGraph(segments, narrationDur, windowStart, windowDur,
     }
 
     const subFilter = subsPath ? `,subtitles='${escapeAssPath(subsPath)}'` : '';
-    parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${subFilter}[vout]`);
+    parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${overlayInline}${subFilter}[vout]`);
 
     logger.info(
       `[videoExplainerRenderer] stretch (TTS-synced): ${segments.length} segments, ` +
@@ -526,7 +643,7 @@ function buildStretchFilterGraph(segments, narrationDur, windowStart, windowDur,
       `setpts=(PTS-STARTPTS)/${speed.toFixed(6)},` +
       `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
       `crop=${dims.width}:${dims.height},` +
-      `fps=${TARGET_FPS},setsar=1`;
+      `fps=${TARGET_FPS},setsar=1${hardenInline}`;
 
     if (freezeFrames > 0) {
       chain += `,tpad=stop_mode=clone:stop_duration=${(freezeFrames / TARGET_FPS).toFixed(3)}`;
@@ -538,7 +655,7 @@ function buildStretchFilterGraph(segments, narrationDur, windowStart, windowDur,
   }
 
   const subFilter = subsPath ? `,subtitles='${escapeAssPath(subsPath)}'` : '';
-  parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${subFilter}[vout]`);
+  parts.push(`${labels.join('')}concat=n=${segments.length}:v=1:a=0${overlayInline}${subFilter}[vout]`);
 
   logger.info(
     `[videoExplainerRenderer] stretch: ${segments.length} segments, totalFrames=${totalFrames}`

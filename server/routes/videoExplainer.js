@@ -38,6 +38,7 @@ import {
   loadCachedEpisodeSummaries, loadCachedBundleSummary,
 } from '../services/storySummarizer.js';
 import { writeExplainerScript } from '../services/explainerScriptWriter.js';
+import { generateTitlePack, loadTitlePack } from '../services/titleGenerator.js';
 import { logger } from '../utils/logger.js';
 
 /**
@@ -235,10 +236,13 @@ router.post('/:id/explainer/run', validateProject, async (req, res, next) => {
     const language = (req.body?.language || 'en').trim();
     const force = req.body?.force === true || req.body?.force === 'true';
     const manualSkipWindows = parseManualSkipWindows(req.body?.manualSkipWindows);
+    const validFormats = ['recap', 'takeaways', 'motivational', 'highlights'];
+    const outputFormat = validFormats.includes(req.body?.outputFormat) ? req.body.outputFormat : 'recap';
 
-    // Persist the user's manual skips so the UI can prefill on next visit.
+    // Persist user choices so the UI can prefill on next visit.
     project.config = project.config || {};
     project.config.manualSkipWindows = manualSkipWindows;
+    project.config.outputFormat = outputFormat;
     await safeWriteJson(projectPath(req.params.id, 'project.json'), project);
 
     runJob(req.params.id, async () => {
@@ -395,7 +399,7 @@ router.post('/:id/explainer/run', validateProject, async (req, res, next) => {
 
         const script = await writeExplainerScript(
           req.params.id, chosenScenes, onStep('script'),
-          { targetReelSec: targetDurationSec, bundleSummary }
+          { targetReelSec: targetDurationSec, bundleSummary, outputFormat }
         );
 
         project.state.script = 'complete';
@@ -479,6 +483,28 @@ router.get('/:id/explainer/preview', validateProject, async (req, res, next) => 
       },
       scenes: rows,
     });
+  } catch (err) { next(err); }
+});
+
+// ─── GET /:id/explainer/title ────────────────────────────────────────────────
+// Return the cached title pack if present, else 204.
+
+router.get('/:id/explainer/title', validateProject, async (req, res, next) => {
+  try {
+    const pack = await loadTitlePack(req.params.id);
+    if (!pack) return res.status(204).end();
+    res.json(pack);
+  } catch (err) { next(err); }
+});
+
+// ─── POST /:id/explainer/title ───────────────────────────────────────────────
+// Generate (or regenerate) the title pack. Cheap LLM call.
+
+router.post('/:id/explainer/title', validateProject, async (req, res, next) => {
+  try {
+    const force = req.body?.force === true || req.body?.force === 'true';
+    const pack = await generateTitlePack(req.params.id, { force });
+    res.json(pack);
   } catch (err) { next(err); }
 });
 

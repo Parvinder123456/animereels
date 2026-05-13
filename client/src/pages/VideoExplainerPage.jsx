@@ -22,6 +22,13 @@ const ASPECTS = [
   { id: '1:1',  label: '1:1 Square' },
 ];
 
+const OUTPUT_FORMATS = [
+  { id: 'recap',        label: 'Condensed Recap',     desc: 'Chronological summary of the key moments.' },
+  { id: 'takeaways',    label: 'Top Takeaways',       desc: 'Numbered list of actionable insights.' },
+  { id: 'motivational', label: 'Apply It / Motivational', desc: 'Inspirational spin — how to use this in your life.' },
+  { id: 'highlights',   label: 'Best Moments',        desc: 'Punchy highlight reel of strongest beats.' },
+];
+
 /* ── Styles ──────────────────────────────────────────────────────── */
 
 const s = {
@@ -77,13 +84,29 @@ export default function VideoExplainerPage() {
   const [targetMinutes, setTargetMinutes] = useState(60);
   const [skipWindowsText, setSkipWindowsText] = useState('');
   const [forceRefresh, setForceRefresh] = useState(false);
+  const [outputFormat, setOutputFormat] = useState('recap');
 
   // Voice step
   const [voiceId, setVoiceId] = useState(VOICES[0].id);
   const [engine, setEngine] = useState('edge');
+  const [elevenVoices, setElevenVoices] = useState(null);
 
   // Render step
   const [aspect, setAspect] = useState('16:9');
+  const [hardenEnabled, setHardenEnabled] = useState(false);
+  const [hardenFlip, setHardenFlip] = useState(true);
+  const [hardenPitchShift, setHardenPitchShift] = useState(true);
+  const [hardenWatermark, setHardenWatermark] = useState('');
+
+  // Title + description generator
+  const [titleData, setTitleData] = useState(null);
+  const [titleBusy, setTitleBusy] = useState(false);
+
+  // YouTube upload
+  const [ytAuthed, setYtAuthed] = useState(false);
+  const [ytPrivacy, setYtPrivacy] = useState('private');
+  const [ytUploading, setYtUploading] = useState(false);
+  const [ytResult, setYtResult] = useState(null);
 
   // Preview
   const [preview, setPreview] = useState(null);
@@ -121,6 +144,43 @@ export default function VideoExplainerPage() {
       get(`/projects/${id}/explainer/preview`).then(setPreview).catch(() => {});
     }
   }, [project?.state?.script, project?.updatedAt, id]);
+
+  // Hydrate saved render config from project.json
+  useEffect(() => {
+    const cfg = project?.config;
+    if (!cfg) return;
+    if (typeof cfg.outputFormat === 'string' && OUTPUT_FORMATS.some(f => f.id === cfg.outputFormat)) {
+      setOutputFormat(cfg.outputFormat);
+    }
+    const hc = cfg.copyrightHardening;
+    if (hc && typeof hc === 'object' && hc.enabled !== false) {
+      setHardenEnabled(true);
+      if (hc.flip === false) setHardenFlip(false);
+      if (hc.pitchShift === false) setHardenPitchShift(false);
+      if (typeof hc.watermark === 'string') setHardenWatermark(hc.watermark);
+    }
+  }, [project?.config?.outputFormat, project?.config?.copyrightHardening]);
+
+  // Auto-load generated title/description if it exists
+  useEffect(() => {
+    if (project?.state?.script === 'complete') {
+      get(`/projects/${id}/explainer/title`).then(setTitleData).catch(() => {});
+    }
+  }, [project?.state?.script, project?.updatedAt, id]);
+
+  // YouTube auth status
+  useEffect(() => {
+    get('/youtube/status').then(d => setYtAuthed(!!d?.authenticated)).catch(() => {});
+  }, []);
+
+  // ElevenLabs voices when engine flips
+  useEffect(() => {
+    if (engine === 'elevenlabs' && !elevenVoices) {
+      get('/voice/elevenlabs/voices').then(d => {
+        if (Array.isArray(d?.voices)) setElevenVoices(d.voices);
+      }).catch(() => setElevenVoices([]));
+    }
+  }, [engine, elevenVoices]);
 
   /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -174,16 +234,51 @@ export default function VideoExplainerPage() {
     targetDurationSec: Math.max(60, Number(targetMinutes) * 60),
     language: 'en', force: forceRefresh,
     manualSkipWindows: skipWindowsText.trim(),
+    outputFormat,
   }));
 
   const regenerateScript = () => act(() => post(`/projects/${id}/explainer/run`, {
     targetDurationSec: Math.max(60, Number(targetMinutes) * 60),
     language: 'en', force: false,
     manualSkipWindows: skipWindowsText.trim(),
+    outputFormat,
   }));
 
   const generateVoice = () => act(() => post(`/projects/${id}/voice/generate`, { voiceId, engine }));
-  const renderVideo   = () => act(() => post(`/projects/${id}/render`, { aspect }));
+
+  const renderVideo = () => act(() => post(`/projects/${id}/render`, {
+    aspect,
+    copyrightHardening: hardenEnabled
+      ? { enabled: true, flip: hardenFlip, pitchShift: hardenPitchShift, watermark: hardenWatermark.trim() }
+      : false,
+  }));
+
+  const generateTitle = async () => {
+    setError(null); setTitleBusy(true);
+    try {
+      const r = await post(`/projects/${id}/explainer/title`, {});
+      setTitleData(r);
+    } catch (e) { setError(e.message); }
+    finally { setTitleBusy(false); }
+  };
+
+  const copy = (text) => navigator.clipboard?.writeText(text || '').catch(() => {});
+
+  const uploadToYouTube = async () => {
+    setError(null); setYtUploading(true); setYtResult(null);
+    try {
+      const form = new FormData();
+      if (titleData?.titles?.[0]) form.append('title', titleData.titles[0]);
+      if (titleData?.description) form.append('description', titleData.description);
+      if (Array.isArray(titleData?.tags)) form.append('tags', JSON.stringify(titleData.tags));
+      form.append('privacy', ytPrivacy);
+      const res = await fetch(`/api/youtube/upload/${id}`, { method: 'POST', body: form });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+      const data = await res.json();
+      setYtResult({ started: data?.started === true });
+    } catch (e) { setError(e.message); }
+    finally { setYtUploading(false); }
+  };
 
   /* ── Derived state ──────────────────────────────────────────────── */
 
@@ -280,6 +375,13 @@ export default function VideoExplainerPage() {
           <div style={s.field}>
             <label style={s.label}>Target output (minutes)</label>
             <input type="number" min="2" max="180" value={targetMinutes} onChange={e => setTargetMinutes(e.target.value)} />
+          </div>
+          <div style={s.field}>
+            <label style={s.label}>Output format</label>
+            <select value={outputFormat} onChange={e => setOutputFormat(e.target.value)}>
+              {OUTPUT_FORMATS.map(f => <option key={f.id} value={f.id}>{f.label}</option>)}
+            </select>
+            <div style={s.hint}>{OUTPUT_FORMATS.find(f => f.id === outputFormat)?.desc}</div>
           </div>
           <button className="btn-primary" onClick={runPipeline} disabled={isWorking || !sourceReady}>
             {analyzeDone ? 'Re-analyze' : 'Analyze'}
@@ -411,6 +513,53 @@ export default function VideoExplainerPage() {
         </div>
       )}
 
+      {/* ── Title + description card ───────────────────────────────── */}
+      {analyzeDone && (
+        <div style={s.card}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+            <div style={s.stepLabel}>YouTube title + description</div>
+            <button className="btn-secondary" onClick={generateTitle} disabled={titleBusy} style={{ fontSize: 11, padding: '4px 10px' }}>
+              {titleBusy ? 'Generating…' : (titleData ? 'Re-generate' : 'Generate')}
+            </button>
+          </div>
+          {!titleData && !titleBusy && (
+            <div style={s.hint}>Click Generate to produce 3 title variants + description + tags from the script.</div>
+          )}
+          {titleData?.titles?.length > 0 && (
+            <>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {titleData.titles.map((t, i) => (
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)', minWidth: 24 }}>#{i + 1}</span>
+                    <span style={{ flex: 1, fontSize: 13, color: 'var(--text-primary)' }}>{t}</span>
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t.length}ch</span>
+                    <button className="btn-secondary" onClick={() => copy(t)} style={{ fontSize: 10, padding: '2px 6px' }}>Copy</button>
+                  </div>
+                ))}
+              </div>
+              {titleData.description && (
+                <div style={{ marginTop: 6 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Description ({titleData.description.length} chars)</span>
+                    <button className="btn-secondary" onClick={() => copy(titleData.description)} style={{ fontSize: 10, padding: '2px 6px' }}>Copy</button>
+                  </div>
+                  <pre style={{ fontSize: 11, color: 'var(--text-secondary)', whiteSpace: 'pre-wrap', maxHeight: 200, overflow: 'auto', margin: '6px 0 0 0', padding: 8, background: 'rgba(255,255,255,0.03)', borderRadius: 4 }}>
+                    {titleData.description}
+                  </pre>
+                </div>
+              )}
+              {Array.isArray(titleData.tags) && titleData.tags.length > 0 && (
+                <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Tags:</span>
+                  <span style={{ flex: 1, fontSize: 11, color: 'var(--text-secondary)' }}>{titleData.tags.join(', ')}</span>
+                  <button className="btn-secondary" onClick={() => copy(titleData.tags.join(', '))} style={{ fontSize: 10, padding: '2px 6px' }}>Copy</button>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
       {/* ── Step 3: Voice ───────────────────────────────────────────── */}
       <div style={{ ...s.card, opacity: analyzeDone ? 1 : 0.4, pointerEvents: analyzeDone ? 'auto' : 'none' }}>
         <div style={s.stepLabel}>Step 3 &middot; Generate narration</div>
@@ -418,7 +567,9 @@ export default function VideoExplainerPage() {
           <div style={s.field}>
             <label style={s.label}>Voice</label>
             <select value={voiceId} onChange={e => setVoiceId(e.target.value)}>
-              {VOICES.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
+              {engine === 'elevenlabs' && Array.isArray(elevenVoices) && elevenVoices.length > 0
+                ? elevenVoices.map(v => <option key={v.id} value={v.id}>{v.label}</option>)
+                : VOICES.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
             </select>
           </div>
           <div style={s.field}>
@@ -427,6 +578,9 @@ export default function VideoExplainerPage() {
               <option value="edge">Edge TTS (free)</option>
               <option value="elevenlabs">ElevenLabs (paid)</option>
             </select>
+            {engine === 'elevenlabs' && elevenVoices === null && (
+              <div style={s.hint}>Loading ElevenLabs voices…</div>
+            )}
           </div>
           <button className="btn-primary" onClick={generateVoice} disabled={isWorking || !analyzeDone}>
             {voiceDone ? 'Re-generate' : 'Generate'}
@@ -454,8 +608,77 @@ export default function VideoExplainerPage() {
             </a>
           )}
         </div>
+
+        <details>
+          <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--text-secondary)' }}>
+            Copyright hardening (Content ID evasion)
+          </summary>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: 'pointer' }}>
+              <input type="checkbox" checked={hardenEnabled} onChange={e => setHardenEnabled(e.target.checked)} />
+              <strong>Enable hardening</strong> — applies hue/contrast shift, 1.5% crop, +1% audio pitch, optional flip & watermark
+            </label>
+            {hardenEnabled && (
+              <>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: 'pointer' }}>
+                  <input type="checkbox" checked={hardenFlip} onChange={e => setHardenFlip(e.target.checked)} />
+                  Horizontal flip (mirror)
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: 'pointer' }}>
+                  <input type="checkbox" checked={hardenPitchShift} onChange={e => setHardenPitchShift(e.target.checked)} />
+                  +1% pitch shift on source audio (preserves duration)
+                </label>
+                <div style={s.field}>
+                  <label style={s.label}>Watermark text (optional)</label>
+                  <input
+                    type="text" maxLength={60}
+                    placeholder="e.g. Your Channel Name"
+                    value={hardenWatermark}
+                    onChange={e => setHardenWatermark(e.target.value)}
+                  />
+                  <div style={s.hint}>Burned into top-right corner. Leave blank to skip.</div>
+                </div>
+              </>
+            )}
+          </div>
+        </details>
+
         {renderDone && <div style={s.done}>Video ready</div>}
       </div>
+
+      {/* ── YouTube upload ──────────────────────────────────────────── */}
+      {renderDone && (
+        <div style={s.card}>
+          <div style={s.stepLabel}>YouTube upload</div>
+          {!ytAuthed ? (
+            <div style={s.hint}>
+              YouTube OAuth not configured. Place <code>youtube-credentials.json</code> in project root
+              and visit <code>/api/youtube/auth-url</code> to authorize.
+            </div>
+          ) : (
+            <>
+              <div style={s.row}>
+                <div style={s.field}>
+                  <label style={s.label}>Privacy</label>
+                  <select value={ytPrivacy} onChange={e => setYtPrivacy(e.target.value)}>
+                    <option value="private">Private</option>
+                    <option value="unlisted">Unlisted</option>
+                    <option value="public">Public</option>
+                  </select>
+                </div>
+                <button className="btn-primary" onClick={uploadToYouTube} disabled={ytUploading || !renderDone}>
+                  {ytUploading ? 'Starting…' : 'Upload to YouTube'}
+                </button>
+              </div>
+              <div style={s.hint}>
+                Uses the generated title + description above. Progress shows in the SSE bar.
+                {!titleData && ' (Click "Generate" in the title card first for an AI-written title.)'}
+              </div>
+              {ytResult?.started && <div style={s.done}>Upload started — watch the progress bar.</div>}
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
