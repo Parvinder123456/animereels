@@ -443,28 +443,62 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
   await fs.writeFile(filterScriptPath, vfChain, 'utf-8');
   logger.info(`[videoExplainerRenderer] filter: ${vfChain.length} chars, mode=${renderMode}`);
 
-  // Single ffmpeg pass — wrapped in a watchdog + heartbeat so the UI shows
-  // exactly what ffmpeg is doing (or where it stalled) instead of going silent.
+  // Single ffmpeg pass — wrapped in three watchdogs so a stuck render fails
+  // loudly with a useful message instead of hanging your browser:
   //
-  // Three timers run on top of the regular on('progress') events:
-  //   - heartbeat (every 5s): pings the SSE bar with elapsed + last stderr line
-  //                            so the bar never goes quiet during filter init
-  //   - stall watchdog (default 300s gap): if ffmpeg's stderr has been silent
-  //                            that long, kill the process and fail with the
-  //                            last-seen line. Otherwise the job hangs forever
-  //                            on laptop NVENC / libass / OOM cases.
-  //   - hard timeout (default 60 min): absolute upper bound on a single render
-  const STALL_KILL_SEC  = Math.max(60,  Number(project?.config?.renderStallTimeoutSec) || 300);
-  const HARD_TIMEOUT_MS = Math.max(60 * 1000, (Number(project?.config?.renderHardTimeoutMin) || 60) * 60 * 1000);
-  const HEARTBEAT_MS    = 5000;
-  const STALL_WARN_SEC  = 30; // start showing "no ffmpeg output for Ns" in the bar
+  //   stderr-silence watchdog (default 300s):
+  //       ffmpeg produced no stderr lines at all for this long. Catches
+  //       process death, NVENC session hangs, libass font discovery freezes.
+  //
+  //   output-time stall watchdog (default 60s, the real bug killer):
+  //       ffmpeg's stderr keeps printing `time=00:00:20.00 ...` but the
+  //       time= value isn't advancing. This is what happens when a decoder
+  //       hits a corrupt packet: progress lines keep flowing, but output
+  //       doesn't grow. The earlier watchdog couldn't see this; this one
+  //       parses the time= value and bails when it freezes.
+  //
+  //   hard timeout (default 60 min): absolute upper bound.
+  //
+  // PLUS a fatal-pattern detector: certain ffmpeg stderr lines mean the
+  // render is doomed (corrupt input, broken codec). We surface those
+  // immediately instead of waiting for the watchdog.
+  const STALL_KILL_SEC      = Math.max(60,  Number(project?.config?.renderStallTimeoutSec) || 300);
+  const TIME_STALL_SEC      = Math.max(20,  Number(project?.config?.renderTimeStallSec)    || 60);
+  const HARD_TIMEOUT_MS     = Math.max(60 * 1000, (Number(project?.config?.renderHardTimeoutMin) || 60) * 60 * 1000);
+  const HEARTBEAT_MS        = 5000;
+  const STALL_WARN_SEC      = 30;
+
+  // Stderr lines that mean we're doomed. First match → kill ffmpeg + clear error.
+  const FATAL_PATTERNS = [
+    /Error submitting packet to decoder/i,
+    /Invalid data found when processing input/i,
+    /moov atom not found/i,
+    /Conversion failed!/i,
+    /Could not open codec/i,
+    /Failed to inject frame into filter network/i,
+    /Cannot allocate memory/i,
+  ];
+
+  // Parse "time=HH:MM:SS.cc" from a stderr line into seconds.
+  const parseTime = (line) => {
+    const m = line.match(/time=(\d+):(\d{2}):(\d{2}(?:\.\d+)?)/);
+    if (!m) return null;
+    return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+  };
 
   await new Promise((resolve, reject) => {
     const cmd = ffmpeg()
       .setFfmpegPath(getFfmpegPath())
+      // Be tolerant of small input corruption. Without these flags, a single
+      // bad packet stalls the whole pipeline silently.
+      .inputOptions(['-err_detect', 'ignore_err', '-fflags', '+discardcorrupt+genpts'])
       .input(sourcePath)
+      .inputOptions(['-err_detect', 'ignore_err', '-fflags', '+discardcorrupt+genpts'])
       .input(narrationPath);
-    if (musicBed) cmd.input(musicBed.path);
+    if (musicBed) {
+      cmd.inputOptions(['-err_detect', 'ignore_err', '-fflags', '+discardcorrupt+genpts']);
+      cmd.input(musicBed.path);
+    }
     cmd
       .addOption('-filter_complex_script', filterScriptPath)
       .outputOptions([
@@ -483,11 +517,45 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
     let lastPercent = 10;
     let killed = false;
 
-    const truncate = (s) => String(s || '').replace(/[\r\n]+/g, ' ').slice(0, 140);
+    // Output-time tracking — separate from stderr activity tracking.
+    let lastOutputTimeSec = null;
+    let lastTimeAdvanceAt = startedAt;
+
+    const truncate = (s) => String(s || '').replace(/[\r\n]+/g, ' ').slice(0, 200);
+
+    const fatalKill = (reason, line) => {
+      if (killed) return;
+      killed = true;
+      clearInterval(heartbeatHandle);
+      logger.error(`[render] ${reason}. Last line: ${line}`);
+      try { cmd.kill('SIGKILL'); } catch {}
+      reject(new Error(`${reason}. Last ffmpeg line: "${line}"`));
+    };
 
     cmd.on('stderr', (line) => {
       lastStderrAt = Date.now();
       lastStderrLine = truncate(line);
+
+      // Track output-time progression
+      const t = parseTime(line);
+      if (t != null) {
+        if (lastOutputTimeSec == null || t > lastOutputTimeSec + 0.01) {
+          lastOutputTimeSec = t;
+          lastTimeAdvanceAt = Date.now();
+        }
+      }
+
+      // Fatal pattern check — fail fast
+      for (const pat of FATAL_PATTERNS) {
+        if (pat.test(line)) {
+          fatalKill(
+            `ffmpeg fatal: ${pat.source.replace(/\\/g, '')} — likely a corrupt source or narration file. ` +
+            `Try re-running TTS, re-downloading the source, or disabling copyright hardening`,
+            truncate(line)
+          );
+          return;
+        }
+      }
     });
 
     cmd.on('progress', (p) => {
@@ -502,50 +570,54 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
     const heartbeatHandle = setInterval(() => {
       if (killed) return;
       const now = Date.now();
-      const gapSec = (now - lastStderrAt) / 1000;
-      const elapsedSec = (now - startedAt) / 1000;
+      const stderrGapSec = (now - lastStderrAt) / 1000;
+      const timeGapSec   = (now - lastTimeAdvanceAt) / 1000;
+      const elapsedSec   = (now - startedAt) / 1000;
 
-      // Hard timeout — absolute upper bound
+      // Hard timeout
       if ((now - startedAt) > HARD_TIMEOUT_MS) {
-        killed = true;
-        clearInterval(heartbeatHandle);
-        logger.error(
-          `[render] HARD TIMEOUT after ${elapsedSec.toFixed(0)}s. Last ffmpeg line: ${lastStderrLine}`
+        fatalKill(
+          `Render exceeded hard timeout (${(HARD_TIMEOUT_MS / 60000).toFixed(0)} min)`,
+          lastStderrLine
         );
-        try { cmd.kill('SIGKILL'); } catch {}
-        reject(new Error(
-          `Render exceeded hard timeout (${(HARD_TIMEOUT_MS / 60000).toFixed(0)} min). ` +
-          `Last ffmpeg line: "${lastStderrLine}". Try disabling copyright hardening, music bed, or NVENC.`
-        ));
         return;
       }
 
-      // Stall watchdog — no ffmpeg activity for STALL_KILL_SEC
-      if (gapSec > STALL_KILL_SEC) {
-        killed = true;
-        clearInterval(heartbeatHandle);
-        logger.error(
-          `[render] STALLED — no ffmpeg stderr for ${gapSec.toFixed(0)}s. Last line: ${lastStderrLine}`
+      // Output-time stall — the killer fix. ffmpeg may be spewing stderr but
+      // making zero output progress, e.g. when a decoder is stuck after an
+      // "Invalid data found" packet.
+      if (lastOutputTimeSec != null && timeGapSec > TIME_STALL_SEC) {
+        fatalKill(
+          `Render output-time stalled at ${lastOutputTimeSec.toFixed(1)}s for ${timeGapSec.toFixed(0)}s — ` +
+          `ffmpeg's encoder is alive but produces no new frames. Likely a corrupt source/narration packet ` +
+          `(check the log for "Error submitting packet to decoder") or NVENC session contention`,
+          lastStderrLine
         );
-        try { cmd.kill('SIGKILL'); } catch {}
-        reject(new Error(
-          `Render stalled (${gapSec.toFixed(0)}s with no ffmpeg output). ` +
-          `Last seen: "${lastStderrLine}". Likely causes: filter graph too complex, NVENC session conflict, ` +
-          `libass font discovery hang, or OOM. Try disabling copyright hardening + music bed and retry.`
-        ));
         return;
       }
 
-      // Heartbeat — keep the SSE bar alive even when ffmpeg progress is silent
+      // Stderr-silence stall — process truly hung (NVENC / libass / OOM)
+      if (stderrGapSec > STALL_KILL_SEC) {
+        fatalKill(
+          `Render stalled (${stderrGapSec.toFixed(0)}s with no ffmpeg output). ` +
+          `Likely causes: filter graph too complex, NVENC session conflict, libass font discovery hang, or OOM`,
+          lastStderrLine
+        );
+        return;
+      }
+
+      // Heartbeat — show what's really happening
       const tail = lastStderrLine.length > 80 ? lastStderrLine.slice(-80) : lastStderrLine;
-      if (gapSec > STALL_WARN_SEC) {
-        onProgress(
-          `Working ${elapsedSec.toFixed(0)}s · no ffmpeg output for ${gapSec.toFixed(0)}s · last: ${tail}`,
-          lastPercent
-        );
+      const outTimeStr = lastOutputTimeSec != null ? ` out=${lastOutputTimeSec.toFixed(1)}s` : '';
+      let msg;
+      if (lastOutputTimeSec != null && timeGapSec > 15) {
+        msg = `Working ${elapsedSec.toFixed(0)}s · output frozen at ${lastOutputTimeSec.toFixed(1)}s for ${timeGapSec.toFixed(0)}s · ${tail}`;
+      } else if (stderrGapSec > STALL_WARN_SEC) {
+        msg = `Working ${elapsedSec.toFixed(0)}s · no ffmpeg output for ${stderrGapSec.toFixed(0)}s · last: ${tail}`;
       } else {
-        onProgress(`Working ${elapsedSec.toFixed(0)}s · ${tail}`, lastPercent);
+        msg = `Working ${elapsedSec.toFixed(0)}s${outTimeStr} · ${tail}`;
       }
+      onProgress(msg, lastPercent);
     }, HEARTBEAT_MS);
 
     cmd.on('end', stop(() => resolve()));
