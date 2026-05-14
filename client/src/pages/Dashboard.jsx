@@ -3,7 +3,9 @@ import { useNavigate } from 'react-router-dom';
 import { get, post, patch, del } from '../api/client.js';
 
 const PROJECT_TYPES = [
-  { value: 'video_explainer', label: 'Video Explainer',    subtitle: 'YouTube URL or upload → AI narrated recap video.',     icon: '\u{1F3AC}' },
+  { value: 'manga',           label: 'Manga / Manhwa',     subtitle: 'Upload chapter images.',                               icon: '\u{1F4D6}' },
+  { value: 'video_summary',   label: 'Video Summary',      subtitle: 'Upload an anime episode → narrated recap.',            icon: '\u{1F3AC}' },
+  { value: 'video_explainer', label: 'Video Explainer',    subtitle: 'YouTube URL or upload → AI narrated recap video.',     icon: '\u{1F4FA}' },
   { value: 'shorts',          label: 'YouTube Shorts',     subtitle: 'AI picks the best moments → vertical clips.',          icon: '\u{2702}\u{FE0F}' },
   { value: 'translate',       label: 'YouTube Hindi → EN', subtitle: 'Paste a Hindi YouTube URL → English clip.',            icon: '\u{1F310}' },
 ];
@@ -233,7 +235,7 @@ export default function Dashboard() {
   const [error, setError] = useState(null);
   const [showModal, setShowModal] = useState(false);
   const [newName, setNewName] = useState('');
-  const [newType, setNewType] = useState('video_explainer');
+  const [newType, setNewType] = useState('manga');
   const [newUrl, setNewUrl] = useState('');
   const [newTopic, setNewTopic] = useState('');
   const [newManual, setNewManual] = useState(false);
@@ -287,11 +289,28 @@ export default function Dashboard() {
         return;
       }
 
-      const project = await post('/projects', { name: (newName.trim() || 'Untitled Recap') });
-      await patch(`/projects/${project.id}/config`, { projectType: 'video_explainer' });
+      if (!newName.trim()) throw new Error('Project name is required');
+      const project = await post('/projects', { name: newName.trim() });
+
+      if (newType === 'video_summary') {
+        await patch(`/projects/${project.id}/config`, { projectType: 'video_summary' });
+        setShowModal(false);
+        resetModal();
+        navigate(`/projects/${project.id}/video`);
+        return;
+      }
+
+      if (newType === 'video_explainer') {
+        await patch(`/projects/${project.id}/config`, { projectType: 'video_explainer' });
+        setShowModal(false);
+        resetModal();
+        navigate(`/projects/${project.id}/explainer`);
+        return;
+      }
+
       setShowModal(false);
       resetModal();
-      navigate(`/projects/${project.id}/explainer`);
+      navigate(`/projects/${project.id}`);
     } catch (e) {
       setCreateError(e.message);
     } finally {
@@ -303,7 +322,7 @@ export default function Dashboard() {
     setNewName('');
     setNewUrl('');
     setNewTopic('');
-    setNewType('video_explainer');
+    setNewType('manga');
     setNewManual(false);
   }
 

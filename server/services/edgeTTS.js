@@ -51,15 +51,14 @@ export const EDGE_VOICES = [
 ];
 
 /**
- * Wrap text in SSML prosody tags based on mood.
- * Edge TTS accepts inline SSML elements within the voice wrapper.
+ * Build ProsodyOptions for toStream() based on mood.
+ * These are passed as the second argument to tts.toStream(), which applies
+ * them via its own <prosody> wrapper in _SSMLTemplate — no manual SSML needed.
  */
-function wrapWithProsody(text, mood) {
+function getProsodyOptions(mood) {
   const settings = MOOD_PROSODY[mood] || {};
-  const keys = Object.keys(settings);
-  if (!keys.length) return text;
-  const attrs = keys.map(k => `${k}="${settings[k]}"`).join(' ');
-  return `<prosody ${attrs}>${text}</prosody>`;
+  if (!Object.keys(settings).length) return undefined;
+  return settings;
 }
 
 /**
@@ -214,7 +213,7 @@ function generateSilenceFile(durationSec, outputPath) {
  * Synthesise a single chunk of text using Edge TTS.
  * Returns { audioBuffer, wordBoundaries }.
  */
-async function synthesiseChunk(voiceName, text) {
+async function synthesiseChunk(voiceName, text, prosodyOptions) {
   logger.info(`[edgeTTS synthesiseChunk] Creating MsEdgeTTS instance, voice: ${voiceName}`);
   const tts = new MsEdgeTTS();
 
@@ -224,8 +223,8 @@ async function synthesiseChunk(voiceName, text) {
   });
   logger.info(`[edgeTTS synthesiseChunk] setMetadata complete`);
 
-  logger.info(`[edgeTTS synthesiseChunk] Calling toStream (${text.length} chars)`);
-  const { audioStream, metadataStream } = tts.toStream(text);
+  logger.info(`[edgeTTS synthesiseChunk] Calling toStream (${text.length} chars)${prosodyOptions ? ` prosody: ${JSON.stringify(prosodyOptions)}` : ''}`);
+  const { audioStream, metadataStream } = tts.toStream(text, prosodyOptions);
   logger.info(`[edgeTTS synthesiseChunk] toStream returned — audioStream: ${!!audioStream}, metadataStream: ${!!metadataStream}`);
 
   logger.info(`[edgeTTS synthesiseChunk] Collecting audio and metadata streams in parallel`);
@@ -267,12 +266,17 @@ export async function generateNarration(projectId, voiceName, onProgress = () =>
   let globalTimeOffset = 0.0;
 
   const hookText = (script.hook || '').trim();
-  if (hookText) logger.info(`[edgeTTS generateNarration] Prepending hook (${hookText.length} chars) to segment 0`);
 
-  const segments = script.segments.map((seg, i) => {
-    if (i === 0 && hookText) return { ...seg, text: hookText + ' ' + (seg.text || '') };
-    return seg;
-  });
+  // Generate hook as a separate segment so it gets its own TTS timing slot.
+  // Prepending it to segment 0 caused extreme video/narration mismatches
+  // (e.g. 3s video clip with 25s of narration → frozen frames).
+  const segments = [];
+  if (hookText) {
+    const seg0 = script.segments[0];
+    segments.push({ ...seg0, text: hookText, _isHook: true });
+    logger.info(`[edgeTTS generateNarration] Hook as separate segment (${hookText.length} chars, scene from seg 0)`);
+  }
+  segments.push(...script.segments);
   logger.info(`[edgeTTS generateNarration] Processing ${segments.length} segment(s) total`);
 
   for (let i = 0; i < segments.length; i++) {
@@ -316,10 +320,10 @@ export async function generateNarration(projectId, voiceName, onProgress = () =>
 
     const segStartTime = globalTimeOffset;
 
-    // Apply SSML prosody based on mood
-    const prosodyText = wrapWithProsody(segText, moodKey);
-    const chunks = splitTextIntoChunks(prosodyText);
-    logger.info(`[edgeTTS generateNarration] Segment ${i + 1} split into ${chunks.length} chunk(s)`);
+    // Pass prosody options to toStream() instead of wrapping in SSML tags
+    const prosodyOpts = getProsodyOptions(moodKey);
+    const chunks = splitTextIntoChunks(segText);
+    logger.info(`[edgeTTS generateNarration] Segment ${i + 1} split into ${chunks.length} chunk(s)${prosodyOpts ? ` prosody: ${JSON.stringify(prosodyOpts)}` : ''}`);
     let segWordCount = 0;
 
     for (let j = 0; j < chunks.length; j++) {
@@ -327,7 +331,7 @@ export async function generateNarration(projectId, voiceName, onProgress = () =>
       logger.info(`[edgeTTS generateNarration] Chunk ${j + 1}/${chunks.length} — ${chunks[j].length} chars, output: ${chunkPath}`);
       logger.info(`[edgeTTS generateNarration] Chunk text preview: "${chunks[j].slice(0, 80)}..."`);
 
-      const { audioBuffer, wordBoundaries } = await synthesiseChunk(voiceName, chunks[j]);
+      const { audioBuffer, wordBoundaries } = await synthesiseChunk(voiceName, chunks[j], prosodyOpts);
 
       logger.info(`[edgeTTS generateNarration] Writing ${audioBuffer.length} bytes to ${chunkPath}`);
       await fs.writeFile(chunkPath, audioBuffer);

@@ -57,7 +57,7 @@ router.post('/:id/voice/generate', validateProject, async (req, res, next) => {
     }
 
     const { voiceId, engine } = req.body;
-    if (!voiceId) return res.status(400).json({ error: 'voiceId is required' });
+    if (!voiceId && engine === 'edge') return res.status(400).json({ error: 'voiceId is required' });
 
     const project = req.project;
 
@@ -114,7 +114,7 @@ router.post('/:id/voice/upload', validateProject, upload.single('audio'), async 
 router.post('/:id/voice/preview', validateProject, async (req, res, next) => {
   try {
     const { voiceId, engine } = req.body;
-    if (!voiceId) return res.status(400).json({ error: 'voiceId is required' });
+    if (!voiceId && engine === 'edge') return res.status(400).json({ error: 'voiceId is required' });
 
     const previewFn = engine === 'edge' ? generatePreviewEdge : generatePreview;
     const previewPath = await previewFn(req.params.id, voiceId);

@@ -195,11 +195,11 @@ function computeSegmentTiming(segments, segmentBoundaries, windowStart, windowEn
     frameCount = Math.max(1, frameCount);
     assignedFrames += frameCount;
 
-    // Freeze frames for stretch mode when video is shorter than slot
+    // Freeze frames when video is shorter than the TTS slot (e.g. speed
+    // clamped to 0.25 but source clip is too short to fill the narration slot).
+    // tpad=stop_mode=clone holds the last frame to fill the gap.
     const videoFrames = Math.round((srcDur / speed) * TARGET_FPS);
-    const freezeFrames = renderMode === 'stretch'
-      ? Math.max(0, frameCount - videoFrames)
-      : 0;
+    const freezeFrames = Math.max(0, frameCount - videoFrames);
 
     timing.push({ srcStart, srcEnd, ttsSlot, speed, frameCount, freezeFrames });
   }
@@ -261,7 +261,19 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
 
   // Source window
   const sourceDur = await ffprobeDuration(sourcePath);
-  const segments = script.segments;
+  // If TTS generated the hook as a separate segment, reconstruct the same
+  // segment list so boundaries line up 1:1.  The hook segment reuses the
+  // first script segment's video coordinates.
+  const hookText = (script.hook || '').trim();
+  const hasHookSegment = hookText && segmentBoundaries.length === script.segments.length + 1;
+  const segments = hasHookSegment
+    ? [{ ...script.segments[0], text: hookText, _isHook: true }, ...script.segments]
+    : script.segments;
+
+  if (hasHookSegment) {
+    logger.info(`[videoExplainerRenderer] hook detected as separate TTS segment — ${segments.length} total segments`);
+  }
+
   const windowStart = Math.max(0, Number(segments[0].sourceStart) || 0);
   const windowEnd = Math.min(sourceDur, Number(segments[segments.length - 1].sourceEnd) || sourceDur);
   const windowDur = windowEnd - windowStart;
@@ -365,7 +377,7 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
   //   release=400ms  — gentle rise back when narrator pauses
   //   makeup=0       — we set the resting volume manually instead
   const REST_VOLUME = 0.55;
-  const SIDECHAIN = `sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400:makeup=0`;
+  const SIDECHAIN = `sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400:makeup=1`;
 
   let audioMapping = '1:a';
   if (srcHasAudio) {
@@ -482,14 +494,22 @@ function buildContinuousFilterGraph(segments, timing, dims, subsPath, hardenCfg)
     const t = timing[i];
     const label = `s${i}`;
 
-    parts.push(
+    const videoFrames = Math.max(1, t.frameCount - t.freezeFrames);
+    const loopCount = t.freezeFrames > 0 ? Math.ceil(t.frameCount / videoFrames) : 0;
+
+    let chain =
       `[0:v]trim=start=${t.srcStart.toFixed(3)}:end=${t.srcEnd.toFixed(3)},` +
       `setpts=(PTS-STARTPTS)/${t.speed.toFixed(6)},` +
       `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
       `crop=${dims.width}:${dims.height},` +
-      `fps=${TARGET_FPS},setsar=1${hardenInline},` +
-      `trim=end_frame=${t.frameCount},setpts=PTS-STARTPTS[${label}]`
-    );
+      `fps=${TARGET_FPS},setsar=1${hardenInline}`;
+
+    if (loopCount > 1) {
+      chain += `,loop=loop=${loopCount - 1}:size=${videoFrames}`;
+    }
+
+    chain += `,trim=end_frame=${t.frameCount},setpts=PTS-STARTPTS[${label}]`;
+    parts.push(chain);
     labels.push(`[${label}]`);
   }
 
@@ -515,14 +535,34 @@ function buildCutFilterGraph(segments, narrationDur, windowStart, dims, subsPath
       const t = timing[i];
       const label = `s${i}`;
 
-      parts.push(
-        `[0:v]trim=start=${t.srcStart.toFixed(3)}:end=${t.srcEnd.toFixed(3)},` +
-        `setpts=(PTS-STARTPTS)/${t.speed.toFixed(6)},` +
-        `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
-        `crop=${dims.width}:${dims.height},` +
-        `fps=${TARGET_FPS},setsar=1${hardenInline},` +
-        `trim=end_frame=${t.frameCount},setpts=PTS-STARTPTS[${label}]`
-      );
+      // When source clip can't fill the narration slot even at min speed,
+      // loop the clip instead of freezing the last frame (faster + looks better).
+      const loopCount = t.freezeFrames > 0
+        ? Math.ceil(t.frameCount / Math.max(1, t.frameCount - t.freezeFrames))
+        : 0;
+
+      let chain;
+      if (loopCount > 1) {
+        // loop filter repeats the trimmed clip, then we trim to exact frame count
+        chain =
+          `[0:v]trim=start=${t.srcStart.toFixed(3)}:end=${t.srcEnd.toFixed(3)},` +
+          `setpts=(PTS-STARTPTS)/${t.speed.toFixed(6)},` +
+          `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
+          `crop=${dims.width}:${dims.height},` +
+          `fps=${TARGET_FPS},setsar=1${hardenInline},` +
+          `loop=loop=${loopCount - 1}:size=${Math.max(1, t.frameCount - t.freezeFrames)},` +
+          `trim=end_frame=${t.frameCount},setpts=PTS-STARTPTS[${label}]`;
+      } else {
+        chain =
+          `[0:v]trim=start=${t.srcStart.toFixed(3)}:end=${t.srcEnd.toFixed(3)},` +
+          `setpts=(PTS-STARTPTS)/${t.speed.toFixed(6)},` +
+          `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
+          `crop=${dims.width}:${dims.height},` +
+          `fps=${TARGET_FPS},setsar=1${hardenInline},` +
+          `trim=end_frame=${t.frameCount},setpts=PTS-STARTPTS[${label}]`;
+      }
+
+      parts.push(chain);
       labels.push(`[${label}]`);
     }
 
@@ -558,15 +598,22 @@ function buildCutFilterGraph(segments, narrationDur, windowStart, dims, subsPath
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
     const label = `s${i}`;
+    const videoFrames = Math.round(((seg.sourceEnd - seg.sourceStart) / cutSpeed) * TARGET_FPS);
+    const neededLoops = videoFrames > 0 ? Math.ceil(frameAllocs[i] / videoFrames) : 1;
 
-    parts.push(
+    let chain =
       `[0:v]trim=start=${seg.sourceStart.toFixed(3)}:end=${seg.sourceEnd.toFixed(3)},` +
       `setpts=(PTS-STARTPTS)/${cutSpeed.toFixed(6)},` +
       `scale=w=${dims.width}:h=${dims.height}:force_original_aspect_ratio=increase,` +
       `crop=${dims.width}:${dims.height},` +
-      `fps=${TARGET_FPS},setsar=1${hardenInline},` +
-      `trim=end_frame=${frameAllocs[i]},setpts=PTS-STARTPTS[${label}]`
-    );
+      `fps=${TARGET_FPS},setsar=1${hardenInline}`;
+
+    if (neededLoops > 1) {
+      chain += `,loop=loop=${neededLoops - 1}:size=${videoFrames}`;
+    }
+
+    chain += `,trim=end_frame=${frameAllocs[i]},setpts=PTS-STARTPTS[${label}]`;
+    parts.push(chain);
     labels.push(`[${label}]`);
   }
 
@@ -602,8 +649,11 @@ function buildStretchFilterGraph(segments, narrationDur, windowStart, windowDur,
         `crop=${dims.width}:${dims.height},` +
         `fps=${TARGET_FPS},setsar=1${hardenInline}`;
 
-      if (t.freezeFrames > 0) {
-        chain += `,tpad=stop_mode=clone:stop_duration=${(t.freezeFrames / TARGET_FPS).toFixed(3)}`;
+      const videoFrames = Math.max(1, t.frameCount - t.freezeFrames);
+      const loopCount = t.freezeFrames > 0 ? Math.ceil(t.frameCount / videoFrames) : 0;
+
+      if (loopCount > 1) {
+        chain += `,loop=loop=${loopCount - 1}:size=${videoFrames}`;
       }
 
       chain += `,trim=end_frame=${t.frameCount},setpts=PTS-STARTPTS[${label}]`;
@@ -672,8 +722,11 @@ function buildStretchFilterGraph(segments, narrationDur, windowStart, windowDur,
       `crop=${dims.width}:${dims.height},` +
       `fps=${TARGET_FPS},setsar=1${hardenInline}`;
 
-    if (freezeFrames > 0) {
-      chain += `,tpad=stop_mode=clone:stop_duration=${(freezeFrames / TARGET_FPS).toFixed(3)}`;
+    const vidFrames = Math.max(1, frameAllocs[i] - freezeFrames);
+    const neededLoops = freezeFrames > 0 ? Math.ceil(frameAllocs[i] / vidFrames) : 0;
+
+    if (neededLoops > 1) {
+      chain += `,loop=loop=${neededLoops - 1}:size=${vidFrames}`;
     }
 
     chain += `,trim=end_frame=${frameAllocs[i]},setpts=PTS-STARTPTS[${label}]`;

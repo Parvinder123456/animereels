@@ -212,6 +212,12 @@ export default function Layout({ children }) {
           >
             Dashboard
           </Link>
+          <Link
+            to="/series"
+            style={{ ...styles.navLink, color: location.pathname === '/series' ? 'var(--text-primary)' : 'var(--text-secondary)' }}
+          >
+            Series
+          </Link>
           <AIBackendDropdown />
         </div>
       </nav>

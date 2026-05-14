@@ -194,12 +194,19 @@ export default function VideoExplainerPage() {
 
   // ElevenLabs voices when engine flips
   useEffect(() => {
-    if (engine === 'elevenlabs' && !elevenVoices) {
-      get('/voice/elevenlabs/voices').then(d => {
-        if (Array.isArray(d?.voices)) setElevenVoices(d.voices);
-      }).catch(() => setElevenVoices([]));
+    if (engine === 'elevenlabs') {
+      setVoiceId('');
+      if (!elevenVoices) {
+        get('/voice/elevenlabs/voices').then(d => {
+          if (Array.isArray(d?.voices)) setElevenVoices(d.voices);
+          else setElevenVoices([]);
+        }).catch(() => setElevenVoices([]));
+      }
     }
-  }, [engine, elevenVoices]);
+    if (engine === 'edge') {
+      setVoiceId(VOICES[0].id);
+    }
+  }, [engine]);
 
   // Music bed toggle hydrates from project.config
   useEffect(() => {
@@ -677,8 +684,11 @@ export default function VideoExplainerPage() {
           <div style={s.field}>
             <label style={s.label}>Voice</label>
             <select value={voiceId} onChange={e => setVoiceId(e.target.value)}>
-              {engine === 'elevenlabs' && Array.isArray(elevenVoices) && elevenVoices.length > 0
-                ? elevenVoices.map(v => <option key={v.id} value={v.id}>{v.label}</option>)
+              {engine === 'elevenlabs'
+                ? <>
+                    <option value="">Default (from .env)</option>
+                    {Array.isArray(elevenVoices) && elevenVoices.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
+                  </>
                 : VOICES.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
             </select>
           </div>

@@ -170,17 +170,16 @@ export async function generateNarration(projectId, voiceId, onProgress = () => {
   const segmentBoundaries = [];
   let globalTimeOffset = 0.0;
 
-  // Prepend hook to first segment so it plays as a teaser at the start
+  // Generate hook as a separate segment so it gets its own TTS timing slot.
+  // Prepending it to segment 0 caused extreme video/narration mismatches.
   const hookText = (script.hook || '').trim();
+  const segments = [];
   if (hookText) {
-    logger.info(`[generateNarration] Prepending hook to segment 0 (${hookText.length} chars)`);
+    const seg0 = script.segments[0];
+    segments.push({ ...seg0, text: hookText, _isHook: true });
+    logger.info(`[generateNarration] Hook as separate segment (${hookText.length} chars, scene from seg 0)`);
   }
-  const segments = script.segments.map((seg, i) => {
-    if (i === 0 && hookText) {
-      return { ...seg, text: hookText + ' ' + (seg.text || '') };
-    }
-    return seg;
-  });
+  segments.push(...script.segments);
   logger.info(`[generateNarration] Processing ${segments.length} segments total`);
 
   for (let i = 0; i < segments.length; i++) {
