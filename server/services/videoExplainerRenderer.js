@@ -443,7 +443,22 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
   await fs.writeFile(filterScriptPath, vfChain, 'utf-8');
   logger.info(`[videoExplainerRenderer] filter: ${vfChain.length} chars, mode=${renderMode}`);
 
-  // Single ffmpeg pass
+  // Single ffmpeg pass — wrapped in a watchdog + heartbeat so the UI shows
+  // exactly what ffmpeg is doing (or where it stalled) instead of going silent.
+  //
+  // Three timers run on top of the regular on('progress') events:
+  //   - heartbeat (every 5s): pings the SSE bar with elapsed + last stderr line
+  //                            so the bar never goes quiet during filter init
+  //   - stall watchdog (default 300s gap): if ffmpeg's stderr has been silent
+  //                            that long, kill the process and fail with the
+  //                            last-seen line. Otherwise the job hangs forever
+  //                            on laptop NVENC / libass / OOM cases.
+  //   - hard timeout (default 60 min): absolute upper bound on a single render
+  const STALL_KILL_SEC  = Math.max(60,  Number(project?.config?.renderStallTimeoutSec) || 300);
+  const HARD_TIMEOUT_MS = Math.max(60 * 1000, (Number(project?.config?.renderHardTimeoutMin) || 60) * 60 * 1000);
+  const HEARTBEAT_MS    = 5000;
+  const STALL_WARN_SEC  = 30; // start showing "no ffmpeg output for Ns" in the bar
+
   await new Promise((resolve, reject) => {
     const cmd = ffmpeg()
       .setFfmpegPath(getFfmpegPath())
@@ -462,17 +477,82 @@ export async function renderVideoExplainer(projectId, onProgress = () => {}) {
       ])
       .output(finalPath);
 
+    const startedAt = Date.now();
+    let lastStderrAt = startedAt;
+    let lastStderrLine = '(ffmpeg starting up...)';
+    let lastPercent = 10;
+    let killed = false;
+
+    const truncate = (s) => String(s || '').replace(/[\r\n]+/g, ' ').slice(0, 140);
+
+    cmd.on('stderr', (line) => {
+      lastStderrAt = Date.now();
+      lastStderrLine = truncate(line);
+    });
+
     cmd.on('progress', (p) => {
       if (typeof p.percent === 'number' && Number.isFinite(p.percent)) {
-        onProgress(
-          `Encoding (${renderMode}): ${p.percent.toFixed(1)}%`,
-          10 + Math.min(85, Math.round(p.percent * 0.85))
-        );
+        lastPercent = 10 + Math.min(85, Math.round(p.percent * 0.85));
+        onProgress(`Encoding (${renderMode}): ${p.percent.toFixed(1)}%`, lastPercent);
       }
     });
 
-    cmd.on('end', resolve);
-    cmd.on('error', err => reject(new Error(`Render failed: ${err.message}`)));
+    const stop = (fn) => () => { if (heartbeatHandle) clearInterval(heartbeatHandle); fn(); };
+
+    const heartbeatHandle = setInterval(() => {
+      if (killed) return;
+      const now = Date.now();
+      const gapSec = (now - lastStderrAt) / 1000;
+      const elapsedSec = (now - startedAt) / 1000;
+
+      // Hard timeout — absolute upper bound
+      if ((now - startedAt) > HARD_TIMEOUT_MS) {
+        killed = true;
+        clearInterval(heartbeatHandle);
+        logger.error(
+          `[render] HARD TIMEOUT after ${elapsedSec.toFixed(0)}s. Last ffmpeg line: ${lastStderrLine}`
+        );
+        try { cmd.kill('SIGKILL'); } catch {}
+        reject(new Error(
+          `Render exceeded hard timeout (${(HARD_TIMEOUT_MS / 60000).toFixed(0)} min). ` +
+          `Last ffmpeg line: "${lastStderrLine}". Try disabling copyright hardening, music bed, or NVENC.`
+        ));
+        return;
+      }
+
+      // Stall watchdog — no ffmpeg activity for STALL_KILL_SEC
+      if (gapSec > STALL_KILL_SEC) {
+        killed = true;
+        clearInterval(heartbeatHandle);
+        logger.error(
+          `[render] STALLED — no ffmpeg stderr for ${gapSec.toFixed(0)}s. Last line: ${lastStderrLine}`
+        );
+        try { cmd.kill('SIGKILL'); } catch {}
+        reject(new Error(
+          `Render stalled (${gapSec.toFixed(0)}s with no ffmpeg output). ` +
+          `Last seen: "${lastStderrLine}". Likely causes: filter graph too complex, NVENC session conflict, ` +
+          `libass font discovery hang, or OOM. Try disabling copyright hardening + music bed and retry.`
+        ));
+        return;
+      }
+
+      // Heartbeat — keep the SSE bar alive even when ffmpeg progress is silent
+      const tail = lastStderrLine.length > 80 ? lastStderrLine.slice(-80) : lastStderrLine;
+      if (gapSec > STALL_WARN_SEC) {
+        onProgress(
+          `Working ${elapsedSec.toFixed(0)}s · no ffmpeg output for ${gapSec.toFixed(0)}s · last: ${tail}`,
+          lastPercent
+        );
+      } else {
+        onProgress(`Working ${elapsedSec.toFixed(0)}s · ${tail}`, lastPercent);
+      }
+    }, HEARTBEAT_MS);
+
+    cmd.on('end', stop(() => resolve()));
+    cmd.on('error', stop((err) => {
+      if (killed) return; // already rejected by watchdog
+      reject(new Error(`Render failed: ${err.message}. Last ffmpeg line: "${lastStderrLine}"`));
+    }));
     cmd.run();
   });
 
